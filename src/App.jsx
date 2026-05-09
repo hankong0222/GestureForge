@@ -3,27 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 const acceptedGameTypes = ".zip";
 const apiBaseUrl = "http://localhost:8787";
 const handCameraStreamUrl = `${apiBaseUrl}/api/camera/video`;
-
-const indexGestureOptions = [
-  {
-    id: "index_extend",
-    label: "Index Extend",
-    description: "Index finger straight",
-    pose: {
-      left: { thumb: 0, index: 100, middle: 0, ring: 0, pinky: 0 },
-      right: { thumb: 0, index: 100, middle: 0, ring: 0, pinky: 0 },
-    },
-  },
-  {
-    id: "index_fold",
-    label: "Index Fold",
-    description: "Index finger curled",
-    pose: {
-      left: { thumb: 0, index: 0, middle: 0, ring: 0, pinky: 0 },
-      right: { thumb: 0, index: 0, middle: 0, ring: 0, pinky: 0 },
-    },
-  },
-];
+const savedStateKey = "gestureforge.uiState.v1";
 
 const fingerControls = [
   { id: "thumb", label: "Thumb" },
@@ -61,6 +41,51 @@ const emptyAnalysis = {
   controls: [],
   unresolved: [],
 };
+
+function loadSavedUiState() {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(savedStateKey) || "{}");
+
+    if (!saved || typeof saved !== "object") {
+      return {};
+    }
+
+    return saved;
+  } catch {
+    return {};
+  }
+}
+
+function normalizeFingerCombo(fingers) {
+  const selected = new Set(Array.isArray(fingers) ? fingers : []);
+  return fingerControls.map((finger) => finger.id).filter((finger) => selected.has(finger));
+}
+
+function fingerComboKey(fingers) {
+  return normalizeFingerCombo(fingers).join("|");
+}
+
+function fingerComboLabel(fingers) {
+  const combo = normalizeFingerCombo(fingers);
+
+  if (!combo.length) {
+    return "No Fingers";
+  }
+
+  return combo
+    .map((fingerId) => fingerControls.find((finger) => finger.id === fingerId)?.label ?? fingerId)
+    .join(" + ");
+}
+
+function poseFromFingers(fingers) {
+  const combo = new Set(normalizeFingerCombo(fingers));
+  const pose = Object.fromEntries(fingerControls.map((finger) => [finger.id, combo.has(finger.id) ? 100 : 0]));
+
+  return {
+    left: pose,
+    right: pose,
+  };
+}
 
 function sourceIdentity(item) {
   if (!item || typeof item !== "object") {
@@ -425,69 +450,127 @@ function UploadPanel({
 function ChooseGesturePanel({
   analysis,
   mappings,
+  draftMappings,
+  selectedControlId,
+  conflictPulse,
   patchReport,
   isPlanningPatch,
   isApplyingPatch,
   patchApplyError,
-  onMappingChange,
+  onDraftMappingChange,
+  onConfirmMapping,
+  onSelectControl,
   onBack,
   onPlan,
   onApplyPlan,
   onDisplay,
 }) {
   const controls = analysis?.controls ?? [];
-  const previewGesture = indexGestureOptions.find((option) => option.id === Object.values(mappings)[0]);
-  const previewPose = previewGesture?.pose ?? indexGestureOptions[0].pose;
+  const selectedControl = controls.find((control) => control.id === selectedControlId) ?? controls[0];
+  const activeControlId = selectedControl?.id;
+  const activeDraft = draftMappings[activeControlId] ?? [];
+  const previewPose = poseFromFingers(activeDraft);
   const patchStatus = patchReport?.status;
   const plannedPatches = patchReport?.patches?.length ?? 0;
   const runtimeInjections = patchReport?.runtime_injections?.length ?? 0;
   const manualReviewCount = patchReport?.manual_review?.length ?? 0;
   const canApplyPlan = plannedPatches > 0 || runtimeInjections > 0;
-  const gestureConflicts = indexGestureOptions
-    .map((gesture) => ({
-      gesture,
-      controls: controls.filter((control) => mappings[control.id] === gesture.id),
-    }))
-    .filter((group) => group.controls.length > 1);
+  const allConfirmed = controls.length > 0 && controls.every((control) => Array.isArray(mappings[control.id]));
+
+  function toggleFinger(fingerId) {
+    if (!activeControlId) {
+      return;
+    }
+
+    const current = draftMappings[activeControlId] ?? [];
+    const next = current.includes(fingerId)
+      ? current.filter((item) => item !== fingerId)
+      : [...current, fingerId];
+    onDraftMappingChange(activeControlId, normalizeFingerCombo(next));
+  }
 
   return (
-    <section className="stage-panel gesture-stage">
+    <section className={`stage-panel gesture-stage${conflictPulse ? " is-shaking" : ""}`}>
       <p className="eyebrow">Level 02</p>
       <h1 id="page-title">CHOOSE THE GESTURE</h1>
       <p className="intro">
-        Assign each detected keyboard control to an index finger gesture.
+        Pick one or more extended fingers for each action. Empty means every finger is folded.
       </p>
 
       <div className="mapping-workbench">
-        <div className="control-list" aria-label="Detected keyboard controls">
+        <div className="finger-picker" aria-label="Finger extension reference">
           <div className="board-title">
-            <span>Detected Controls</span>
-            <span className="mini-led">{controls.length} FOUND</span>
+            <span>{selectedControl ? selectedControl.action : "Finger Extend"}</span>
+            <span className="mini-led">{fingerComboLabel(activeDraft)}</span>
           </div>
-          {controls.map((control, index) => {
-            const selectedGesture = mappings[control.id] ?? indexGestureOptions[index % indexGestureOptions.length].id;
+          <div className="finger-reference" role="group" aria-label="Selected action fingers">
+            {fingerControls.map((finger) => (
+              <button
+                className={`finger-reference-row${activeDraft.includes(finger.id) ? " is-active" : ""}`}
+                disabled={!selectedControl}
+                key={finger.id}
+                type="button"
+                onClick={() => toggleFinger(finger.id)}
+              >
+                <span>{finger.label}</span>
+                <kbd>Extend</kbd>
+              </button>
+            ))}
+            <button
+              className={`finger-reference-row${activeDraft.length === 0 ? " is-active" : ""}`}
+              disabled={!selectedControl}
+              type="button"
+              onClick={() => activeControlId && onDraftMappingChange(activeControlId, [])}
+            >
+              <span>None</span>
+              <kbd>All Fold</kbd>
+            </button>
+          </div>
+          <button
+            className="pixel-button finger-confirm"
+            disabled={!selectedControl}
+            type="button"
+            onClick={() => activeControlId && onConfirmMapping(activeControlId)}
+          >
+            Confirm
+          </button>
+        </div>
+
+        <HandRig pose={previewPose} />
+      </div>
+
+      <div className="action-setup-board" aria-label="Detected keyboard controls">
+        <div className="board-title">
+          <span>Action Setup</span>
+          <span className="mini-led">{controls.length} FOUND</span>
+        </div>
+        <div className="action-setup-list">
+          {controls.map((control) => {
+            const draft = draftMappings[control.id] ?? [];
+            const confirmed = Array.isArray(mappings[control.id]);
+            const isSelected = control.id === activeControlId;
 
             return (
-              <div className="control-map-row" key={control.id}>
-                <div>
-                  <strong>{control.action}</strong>
-                  <span>
-                    {control.key} / {control.code}
-                  </span>
+              <button
+                className={`action-setup-card${confirmed ? " is-confirmed" : " is-unset"}${isSelected ? " is-selected" : ""}`}
+                key={control.id}
+                type="button"
+                onClick={() => onSelectControl(control.id)}
+              >
+                <div className="action-setup-title">
+                  <div>
+                    <strong>{control.action}</strong>
+                    <span>
+                      {control.key} / {control.code}
+                    </span>
+                  </div>
+                  <kbd>{confirmed ? fingerComboLabel(mappings[control.id]) : "Unset"}</kbd>
                 </div>
-                <div className="gesture-choice" role="group" aria-label={`${control.action} gesture`}>
-                  {indexGestureOptions.map((option) => (
-                    <button
-                      className={selectedGesture === option.id ? "is-active" : ""}
-                      key={option.id}
-                      type="button"
-                      onClick={() => onMappingChange(control.id, option.id)}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
+                <div className="action-setup-footer">
+                  <span>{fingerComboLabel(draft)}</span>
+                  <kbd>{isSelected ? "Editing" : "Select"}</kbd>
                 </div>
-              </div>
+              </button>
             );
           })}
           {!controls.length && (
@@ -497,15 +580,13 @@ function ChooseGesturePanel({
             </div>
           )}
         </div>
-
-        <HandRig pose={previewPose} />
       </div>
 
       <div className="actions">
         <button className="pixel-button secondary" type="button" onClick={onBack}>
           Back
         </button>
-        <button className="pixel-button secondary" disabled={!controls.length || isPlanningPatch} type="button" onClick={onPlan}>
+        <button className="pixel-button secondary" disabled={!allConfirmed || isPlanningPatch} type="button" onClick={onPlan}>
           {isPlanningPatch ? "Planning" : patchStatus === "planned" ? "Update Plan" : "Create Plan"}
         </button>
         {patchStatus === "planned" ? (
@@ -520,17 +601,13 @@ function ChooseGesturePanel({
         ) : null}
       </div>
 
-      {gestureConflicts.length > 0 && (
+      {conflictPulse && (
         <div className="gesture-plan-card is-warning">
           <div className="board-title">
             <span>Gesture Conflict</span>
             <span className="mini-led">CHECK</span>
           </div>
-          {gestureConflicts.map((group) => (
-            <p className="patch-note" key={group.gesture.id}>
-              {group.gesture.label}: {group.controls.map((control) => control.action).join(" + ")}
-            </p>
-          ))}
+          <p className="patch-note">Another action already uses this exact finger combo.</p>
         </div>
       )}
 
@@ -595,6 +672,8 @@ function CameraPreview() {
       if (retryTimer) {
         window.clearTimeout(retryTimer);
       }
+
+      fetch(`${apiBaseUrl}/api/camera/stop`, { method: "POST", keepalive: true }).catch(() => {});
     };
   }, []);
 
@@ -645,6 +724,8 @@ function DisplayPanel({
 
         if (target?.gestureForge?.setState) {
           target.gestureForge.setState({
+            hands: Number(state.hands || 0),
+            fingers: state.fingers || {},
             indexExtended: Boolean(state.indexExtended),
             indexFolded: Boolean(state.indexFolded),
           });
@@ -657,6 +738,7 @@ function DisplayPanel({
       }
     }
 
+    fetch(`${apiBaseUrl}/api/camera/start`).catch(() => {});
     pollGestureState();
 
     return () => {
@@ -665,6 +747,8 @@ function DisplayPanel({
       if (timer) {
         window.clearTimeout(timer);
       }
+
+      fetch(`${apiBaseUrl}/api/camera/stop`, { method: "POST", keepalive: true }).catch(() => {});
     };
   }, []);
 
@@ -691,13 +775,12 @@ function DisplayPanel({
         {patchStatus === "plan_failed" && <p className="patch-note">Plan failed. Showing original game.</p>}
         <div className="play-map-list">
           {controls.map((control) => {
-            const gestureId = mappings[control.id];
-            const gesture = indexGestureOptions.find((option) => option.id === gestureId);
+            const fingers = mappings[control.id];
 
             return (
               <div className="play-map-row" key={control.id}>
                 <span>{control.action}</span>
-                <kbd>{gesture?.label ?? "Unmapped"}</kbd>
+                <kbd>{Array.isArray(fingers) ? fingerComboLabel(fingers) : "Unmapped"}</kbd>
               </div>
             );
           })}
@@ -739,12 +822,12 @@ function GesturePreview({ mappings, analysis }) {
           <span className="mini-led">LIVE</span>
         </div>
         {controls.slice(0, 4).map((control) => {
-          const gesture = indexGestureOptions.find((option) => option.id === mappings[control.id]);
+          const fingers = mappings[control.id];
 
           return (
             <div className="mapping-row" key={control.id}>
               <span>{control.action}</span>
-              <kbd>{gesture?.label ?? control.key}</kbd>
+              <kbd>{Array.isArray(fingers) ? fingerComboLabel(fingers) : control.key}</kbd>
             </div>
           );
         })}
@@ -760,33 +843,102 @@ function GesturePreview({ mappings, analysis }) {
 }
 
 export default function App() {
+  const savedUiState = useMemo(loadSavedUiState, []);
   const fileInputRef = useRef(null);
   const [selectedFile, setSelectedFile] = useState(null);
-  const [githubUrl, setGithubUrl] = useState("");
+  const [githubUrl, setGithubUrl] = useState(savedUiState.githubUrl ?? "");
   const [isDragging, setIsDragging] = useState(false);
-  const [currentStep, setCurrentStep] = useState(1);
-  const [analysis, setAnalysis] = useState(emptyAnalysis);
-  const [session, setSession] = useState(null);
-  const [sessionStatus, setSessionStatus] = useState("");
-  const [mappings, setMappings] = useState({});
+  const [currentStep, setCurrentStep] = useState(
+    savedUiState.currentStep === 3 && savedUiState.patchReport?.status !== "patched"
+      ? 2
+      : savedUiState.currentStep ?? 1,
+  );
+  const [analysis, setAnalysis] = useState(savedUiState.analysis ?? emptyAnalysis);
+  const [session, setSession] = useState(savedUiState.session ?? null);
+  const [sessionStatus, setSessionStatus] = useState(savedUiState.sessionStatus ?? "");
+  const [mappings, setMappings] = useState(savedUiState.mappings ?? {});
+  const [draftMappings, setDraftMappings] = useState(savedUiState.draftMappings ?? {});
+  const [selectedControlId, setSelectedControlId] = useState(savedUiState.selectedControlId ?? "");
+  const [conflictPulse, setConflictPulse] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
-  const [patchReport, setPatchReport] = useState(null);
+  const [patchReport, setPatchReport] = useState(savedUiState.patchReport ?? null);
   const [isPlanningPatch, setIsPlanningPatch] = useState(false);
   const [isApplyingPatch, setIsApplyingPatch] = useState(false);
   const [patchApplyError, setPatchApplyError] = useState("");
 
+  useEffect(() => {
+    const safeStep = currentStep === 3 && patchReport?.status !== "patched" ? 2 : currentStep;
+    window.localStorage.setItem(
+      savedStateKey,
+      JSON.stringify({
+        githubUrl,
+        currentStep: safeStep,
+        analysis,
+        session,
+        sessionStatus,
+        mappings,
+        draftMappings,
+        selectedControlId,
+        patchReport,
+      }),
+    );
+  }, [githubUrl, currentStep, analysis, session, sessionStatus, mappings, draftMappings, selectedControlId, patchReport]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function refreshRestoredSession() {
+      if (!session?.session_id) {
+        return;
+      }
+
+      try {
+        const statusResponse = await fetch(`${apiBaseUrl}/api/sessions/${session.session_id}`);
+        const statusPayload = await statusResponse.json();
+
+        if (cancelled) {
+          return;
+        }
+
+        setSessionStatus(statusPayload.status ?? "");
+        setSession((currentSession) => ({ ...currentSession, ...statusPayload }));
+
+        if (statusPayload.status === "ready" && !(analysis.controls ?? []).length) {
+          const analysisResponse = await fetch(`${apiBaseUrl}/api/sessions/${session.session_id}/analysis`);
+          const nextAnalysis = await analysisResponse.json();
+
+          if (!cancelled) {
+            applyAnalysis(statusPayload, nextAnalysis);
+          }
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setErrorMessage(error.message);
+        }
+      }
+    }
+
+    refreshRestoredSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   function applyAnalysis(nextSession, nextAnalysis) {
     const dedupedAnalysis = dedupeAnalysisControls(nextAnalysis);
-    const nextMappings = Object.fromEntries(
+    const nextDraftMappings = Object.fromEntries(
       (dedupedAnalysis.controls ?? []).map((control, index) => [
         control.id,
-        indexGestureOptions[index % indexGestureOptions.length].id,
+        index === 0 ? ["index"] : [],
       ]),
     );
 
     setSession(nextSession);
     setAnalysis(dedupedAnalysis);
-    setMappings(nextMappings);
+    setMappings({});
+    setDraftMappings(nextDraftMappings);
+    setSelectedControlId(dedupedAnalysis.controls?.[0]?.id ?? "");
     setPatchReport(null);
     setPatchApplyError("");
     setCurrentStep(2);
@@ -820,6 +972,12 @@ export default function App() {
   async function createGithubSession() {
     setErrorMessage("");
     setSessionStatus("queued");
+    setAnalysis(emptyAnalysis);
+    setPatchReport(null);
+    setPatchApplyError("");
+    setMappings({});
+    setDraftMappings({});
+    setSelectedControlId("");
 
     try {
       const response = await fetch(`${apiBaseUrl}/api/sessions/github`, {
@@ -848,6 +1006,12 @@ export default function App() {
 
     setErrorMessage("");
     setSessionStatus("queued");
+    setAnalysis(emptyAnalysis);
+    setPatchReport(null);
+    setPatchApplyError("");
+    setMappings({});
+    setDraftMappings({});
+    setSelectedControlId("");
 
     try {
       const response = await fetch(`${apiBaseUrl}/api/sessions/zip`, {
@@ -881,16 +1045,16 @@ export default function App() {
       session_id: session.session_id,
       version: 1,
       controls: (analysis.controls ?? []).map((control) => {
-        const gestureId = mappings[control.id];
-        const gesture = indexGestureOptions.find((option) => option.id === gestureId);
+        const fingers = normalizeFingerCombo(mappings[control.id] ?? []);
 
         return {
           control_id: control.id,
           key: control.key,
           code: control.code,
           action: control.action,
-          gesture: gesture?.id ?? gestureId,
-          gesture_label: gesture?.label ?? gestureId,
+          gesture: fingerComboKey(fingers),
+          gesture_fingers: fingers,
+          gesture_label: fingerComboLabel(fingers),
           suggested_function: control.suggested_function,
           binding_target: control.binding_target,
           usage_targets: control.usage_targets ?? [],
@@ -991,10 +1155,14 @@ export default function App() {
     setSession(null);
     setSessionStatus("");
     setMappings({});
+    setDraftMappings({});
+    setSelectedControlId("");
+    setConflictPulse(false);
     setPatchReport(null);
     setIsApplyingPatch(false);
     setPatchApplyError("");
     setErrorMessage("");
+    window.localStorage.removeItem(savedStateKey);
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -1006,10 +1174,29 @@ export default function App() {
     setCurrentStep(1);
   }
 
-  function updateMapping(controlId, gestureId) {
+  function updateDraftMapping(controlId, fingers) {
+    setDraftMappings((currentDrafts) => ({
+      ...currentDrafts,
+      [controlId]: normalizeFingerCombo(fingers),
+    }));
+  }
+
+  function confirmMapping(controlId) {
+    const nextCombo = normalizeFingerCombo(draftMappings[controlId] ?? []);
+    const nextKey = fingerComboKey(nextCombo);
+    const hasConflict = Object.entries(mappings).some(
+      ([otherControlId, fingers]) => otherControlId !== controlId && fingerComboKey(fingers) === nextKey,
+    );
+
+    if (hasConflict) {
+      setConflictPulse(true);
+      window.setTimeout(() => setConflictPulse(false), 520);
+      return;
+    }
+
     setMappings((currentMappings) => ({
       ...currentMappings,
-      [controlId]: gestureId,
+      [controlId]: nextCombo,
     }));
     setPatchReport(null);
     setPatchApplyError("");
@@ -1034,12 +1221,17 @@ export default function App() {
           analysis={analysis}
           isApplyingPatch={isApplyingPatch}
           isPlanningPatch={isPlanningPatch}
+          conflictPulse={conflictPulse}
+          draftMappings={draftMappings}
           mappings={mappings}
-          onMappingChange={updateMapping}
+          selectedControlId={selectedControlId}
           onApplyPlan={applyConfirmedPatchPlan}
           onBack={() => setCurrentStep(1)}
+          onConfirmMapping={confirmMapping}
           onDisplay={() => setCurrentStep(3)}
+          onDraftMappingChange={updateDraftMapping}
           onPlan={saveMappingAndPlan}
+          onSelectControl={setSelectedControlId}
           patchApplyError={patchApplyError}
           patchReport={patchReport}
         />

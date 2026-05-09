@@ -105,9 +105,14 @@ class HandCamera:
                 }
             )
 
-        index_extended = any(bool(item["states"]["index"]) for item in hand_states)
+        aggregate_states = {
+            finger: any(bool(item["states"].get(finger)) for item in hand_states)
+            for finger in ("thumb", "index", "middle", "ring", "pinky")
+        }
+        index_extended = aggregate_states["index"]
         self.latest_state = {
             "hands": len(hand_states),
+            "fingers": aggregate_states,
             "indexExtended": index_extended,
             "indexFolded": bool(hand_states) and not index_extended,
             "handsDetail": hand_states,

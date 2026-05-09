@@ -218,6 +218,26 @@ async function ensureCameraStream() {
   }
 }
 
+function stopCameraStream() {
+  if (cameraStartPromise) {
+    cameraStartPromise = null;
+  }
+
+  if (!cameraProcess) {
+    cameraError = "";
+    return false;
+  }
+
+  try {
+    cameraProcess.kill();
+  } catch {
+  }
+
+  cameraProcess = null;
+  cameraError = "";
+  return true;
+}
+
 async function proxyCameraVideo(response) {
   await ensureCameraStream();
 
@@ -976,6 +996,16 @@ async function handleRequest(request, response) {
       await ensureCameraStream();
       jsonResponse(response, 200, {
         status: "ready",
+        port: cameraPort,
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/camera/stop") {
+      const stopped = stopCameraStream();
+      jsonResponse(response, 200, {
+        status: "stopped",
+        stopped,
         port: cameraPort,
       });
       return;

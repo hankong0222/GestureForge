@@ -102,13 +102,22 @@ def function_name(control: dict[str, Any]) -> str:
     return js_identifier(str(control.get("action") or control.get("control_id") or "control"))
 
 
-def gesture_state_name(gesture: str) -> str:
-    names = {
-        "index_extend": "indexExtended",
-        "index_fold": "indexFolded",
-    }
+def gesture_fingers(control: dict[str, Any]) -> list[str]:
+    fingers = control.get("gesture_fingers")
 
-    return names.get(gesture, js_identifier(gesture))
+    if isinstance(fingers, list):
+        return [
+            str(finger)
+            for finger in fingers
+            if str(finger) in {"thumb", "index", "middle", "ring", "pinky"}
+        ]
+
+    gesture = str(control.get("gesture") or "")
+
+    if gesture == "index_extend":
+        return ["index"]
+
+    return []
 
 
 def is_edge_triggered(control: dict[str, Any]) -> bool:
@@ -208,11 +217,10 @@ def runtime_source(mapping: dict[str, Any]) -> str:
 
     for control in mapping_controls(mapping):
         function = function_name(control)
-        gesture = str(control.get("gesture") or "")
-        state_name = gesture_state_name(gesture)
+        fingers = gesture_fingers(control)
         entries.append(
             f"    {json.dumps(function)}: "
-            f"{{ gestures: [{json.dumps(state_name)}], edge: {str(is_edge_triggered(control)).lower()} }}"
+            f"{{ fingers: {json.dumps(fingers)}, edge: {str(is_edge_triggered(control)).lower()} }}"
         )
 
         if needs_key_synthesis(control):
@@ -225,7 +233,15 @@ def runtime_source(mapping: dict[str, Any]) -> str:
   var root = window.gestureForge = window.gestureForge || {{}};
   var state = root.state = root.state || {{
     indexExtended: false,
-    indexFolded: true
+    indexFolded: true,
+    fingers: {{
+      thumb: false,
+      index: false,
+      middle: false,
+      ring: false,
+      pinky: false
+    }},
+    hands: 0
   }};
   var controlMap = {{
 {controls_object}
@@ -240,7 +256,15 @@ def runtime_source(mapping: dict[str, Any]) -> str:
 
   root.setState = function setState(nextState) {{
     Object.assign(state, nextState || {{}});
-    state.indexFolded = !state.indexExtended;
+    state.fingers = Object.assign({{
+      thumb: false,
+      index: !!state.indexExtended,
+      middle: false,
+      ring: false,
+      pinky: false
+    }}, state.fingers || {{}}, nextState && nextState.fingers ? nextState.fingers : {{}});
+    state.indexExtended = !!state.fingers.index;
+    state.indexFolded = !!state.hands && !state.indexExtended;
     Object.keys(controlMap).forEach(function updateEdgePulse(action) {{
       var active = rawGestureActive(action);
       var wasActive = !!previousGestureActions[action];
@@ -278,17 +302,19 @@ def runtime_source(mapping: dict[str, Any]) -> str:
 
   function controlConfig(action) {{
     var config = controlMap[action];
-    return config || {{ gestures: [], edge: false }};
-  }}
-
-  function gesturePredicatesFor(action) {{
-    return controlConfig(action).gestures.map(function gestureNameToPredicate(gestureName) {{
-      return root.gestures[gestureName];
-    }});
+    return config || {{ fingers: [], edge: false }};
   }}
 
   function rawGestureActive(action) {{
-    return gesturePredicatesFor(action).some(runPredicate);
+    var fingers = controlConfig(action).fingers || [];
+    var fingerState = state.fingers || {{}};
+
+    if (!state.hands) return false;
+
+    return ["thumb", "index", "middle", "ring", "pinky"].every(function comboMatches(finger) {{
+      var shouldExtend = fingers.indexOf(finger) !== -1;
+      return !!fingerState[finger] === shouldExtend;
+    }});
   }}
 
   function gestureActive(action) {{
@@ -372,7 +398,21 @@ def runtime_source(mapping: dict[str, Any]) -> str:
   }}
 
   function applyCameraState(cameraState) {{
+    var nextFingers = cameraState.fingers || {{}};
+
+    if (!cameraState.fingers && Array.isArray(cameraState.handsDetail)) {{
+      nextFingers = {{ thumb: false, index: false, middle: false, ring: false, pinky: false }};
+      cameraState.handsDetail.forEach(function mergeHand(hand) {{
+        var states = hand.states || {{}};
+        Object.keys(nextFingers).forEach(function mergeFinger(finger) {{
+          nextFingers[finger] = nextFingers[finger] || !!states[finger];
+        }});
+      }});
+    }}
+
     root.setState({{
+      hands: Number(cameraState.hands || 0),
+      fingers: nextFingers,
       indexExtended: !!cameraState.indexExtended,
       indexFolded: !!cameraState.indexFolded
     }});
