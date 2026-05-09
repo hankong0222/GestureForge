@@ -4,6 +4,7 @@
   "description": "A pixel-style React interface for mapping game controls to gestures.",
   "type": "module",
   "scripts": {
+    "backend": "node backend/server.mjs",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"
