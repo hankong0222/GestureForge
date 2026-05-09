@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -532,14 +533,203 @@ def filter_agent_sources(parsed: dict[str, object], evidence: list[Evidence], lo
     return parsed
 
 
+def code_from_key(key: str) -> str:
+    normalized = key.strip()
+    upper = normalized.upper()
+    special_codes = {
+        "SPACE": "Space",
+        "ENTER": "Enter",
+        "ESC": "Escape",
+        "ESCAPE": "Escape",
+        "LEFT": "ArrowLeft",
+        "RIGHT": "ArrowRight",
+        "UP": "ArrowUp",
+        "DOWN": "ArrowDown",
+        "SHIFT": "ShiftLeft",
+        "CTRL": "ControlLeft",
+        "CONTROL": "ControlLeft",
+        "ALT": "AltLeft",
+        "TAB": "Tab",
+    }
+
+    if upper in special_codes:
+        return special_codes[upper]
+
+    if len(upper) == 1 and upper.isalpha():
+        return f"Key{upper}"
+
+    if len(upper) == 1 and upper.isdigit():
+        return f"Digit{upper}"
+
+    return normalized
+
+
+def display_key(key: str) -> str:
+    normalized = key.strip()
+    upper = normalized.upper()
+    names = {
+        "SPACE": "Space",
+        "ENTER": "Enter",
+        "ESC": "Escape",
+        "ESCAPE": "Escape",
+        "LEFT": "Left",
+        "RIGHT": "Right",
+        "UP": "Up",
+        "DOWN": "Down",
+        "CTRL": "Control",
+    }
+
+    return names.get(upper, normalized[:1].upper() + normalized[1:].lower() if len(normalized) > 1 else normalized.upper())
+
+
+def control_id(action_token: str, key: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", f"{action_token}_{key}".lower()).strip("_")
+    return f"ctrl_{slug or 'keyboard'}"
+
+
+def function_name(action_token: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", action_token.strip()).strip("_")
+
+    if not cleaned:
+        return "keyboard"
+
+    if cleaned[0].isdigit():
+        cleaned = f"control_{cleaned}"
+
+    return cleaned[:1].lower() + cleaned[1:]
+
+
+def fallback_output_from_local_candidates(local_candidates: list[LocalCandidate]) -> dict[str, object]:
+    controls: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for candidate in local_candidates:
+        dedupe_key = (candidate.action_token.lower(), candidate.key.upper())
+
+        if dedupe_key in seen:
+            continue
+
+        seen.add(dedupe_key)
+        action_function = function_name(candidate.action_token)
+        controls.append(
+            {
+                "id": control_id(candidate.action_token, candidate.key),
+                "key": display_key(candidate.key),
+                "code": code_from_key(candidate.key),
+                "action": candidate.action_token[:1].upper() + candidate.action_token[1:],
+                "event": "keydown",
+                "source_kind": "engine_input_api" if candidate.api != "config_binding" else "config_binding",
+                "binding_target": asdict(candidate.bindings[0]) if candidate.bindings else None,
+                "usage_targets": [asdict(item) for item in candidate.usages],
+                "replacement_strategy": "replace_usage_check_with_gesture_function"
+                if candidate.usages
+                else "replace_binding_action_with_gesture_function",
+                "suggested_function": f"gestureForge.controls.{action_function}()",
+                "confidence": 0.85 if candidate.usages else 0.72,
+                "evidence": [asdict(item) for item in candidate.bindings],
+            }
+        )
+
+    return {"controls": controls, "unresolved": []}
+
+
+def source_identity(item: object) -> tuple[str, int, str] | None:
+    if not isinstance(item, dict):
+        return None
+
+    return (
+        str(item.get("file") or "").replace("/", "\\").lower(),
+        int(item.get("line") or 0),
+        str(item.get("text") or "").strip(),
+    )
+
+
+def merge_source_lists(*source_lists: object) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    seen: set[tuple[str, int, str]] = set()
+
+    for source_list in source_lists:
+        if not isinstance(source_list, list):
+            continue
+
+        for item in source_list:
+            identity = source_identity(item)
+
+            if identity is None or identity in seen:
+                continue
+
+            seen.add(identity)
+            merged.append(dict(item))
+
+    return merged
+
+
+def normalize_control_key(control: dict[str, object]) -> tuple[str, str, str]:
+    action = str(control.get("action") or control.get("id") or "").strip().lower()
+    key = str(control.get("key") or "").strip().lower()
+    code = str(control.get("code") or "").strip().lower()
+
+    return (action, key, code)
+
+
+def merge_duplicate_controls(parsed: dict[str, object]) -> dict[str, object]:
+    controls = parsed.get("controls", [])
+
+    if not isinstance(controls, list):
+        return parsed
+
+    merged_controls: list[dict[str, object]] = []
+    by_key: dict[tuple[str, str, str], dict[str, object]] = {}
+
+    for item in controls:
+        if not isinstance(item, dict):
+            continue
+
+        key = normalize_control_key(item)
+
+        if not any(key):
+            merged_controls.append(item)
+            continue
+
+        existing = by_key.get(key)
+
+        if existing is None:
+            copied = dict(item)
+            copied["usage_targets"] = merge_source_lists(item.get("usage_targets", []))
+            copied["evidence"] = merge_source_lists(item.get("evidence", []))
+            by_key[key] = copied
+            merged_controls.append(copied)
+            continue
+
+        existing["usage_targets"] = merge_source_lists(existing.get("usage_targets", []), item.get("usage_targets", []))
+        existing["evidence"] = merge_source_lists(existing.get("evidence", []), item.get("evidence", []))
+
+        if not existing.get("binding_target") and item.get("binding_target"):
+            existing["binding_target"] = item["binding_target"]
+
+        existing["confidence"] = max(float(existing.get("confidence") or 0), float(item.get("confidence") or 0))
+
+    parsed["controls"] = merged_controls
+    return parsed
+
+
 def normalize_agent_output(
     raw_output: str,
     evidence: list[Evidence],
     local_candidates: list[LocalCandidate],
 ) -> str:
-    json_text = extract_json_object(raw_output)
-    parsed = json.loads(json_text)
+    try:
+        json_text = extract_json_object(raw_output)
+        parsed = json.loads(json_text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(
+            f"[WARN] Agent returned non-JSON output; using local keyboard candidate fallback. {exc}",
+            file=sys.stderr,
+        )
+        parsed = fallback_output_from_local_candidates(local_candidates)
+
     parsed = filter_agent_sources(parsed, evidence, local_candidates)
+    parsed = merge_duplicate_controls(parsed)
     return json.dumps(parsed, ensure_ascii=False, indent=2)
 
 
@@ -575,15 +765,25 @@ async def run_composio_analysis(args: argparse.Namespace, evidence: list[Evidenc
     )
 
     local_candidates = collect_local_candidates(Path(args.source).resolve(), args.max_files, args.max_context_lines)
-    result = await Runner.run(
-        starting_agent=agent,
-        input=build_agent_input(
-            Path(args.source).resolve(),
-            evidence,
-            local_candidates,
-        ),
-    )
-    return normalize_agent_output(result.final_output, evidence, local_candidates)
+    try:
+        result = await Runner.run(
+            starting_agent=agent,
+            input=build_agent_input(
+                Path(args.source).resolve(),
+                evidence,
+                local_candidates,
+            ),
+        )
+        return normalize_agent_output(result.final_output, evidence, local_candidates)
+    except Exception as exc:
+        print(
+            f"[WARN] Agent analysis failed; using local keyboard candidate fallback. {exc}",
+            file=sys.stderr,
+        )
+        parsed = fallback_output_from_local_candidates(local_candidates)
+        parsed = filter_agent_sources(parsed, evidence, local_candidates)
+        parsed = merge_duplicate_controls(parsed)
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
 
 
 def write_output(output: str, json_out: str | None) -> None:

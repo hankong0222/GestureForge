@@ -87,11 +87,46 @@ Invoke-RestMethod http://localhost:8787/api/sessions/<session_id>/analysis
 ```
 
 The backend clones into `tmp/sessions/<session_id>/original`, writes
-`analysis.json`, accepts `mapping.json`, and serves the game at:
+`analysis.json`, accepts `mapping.json`, applies selected mappings into
+`patched`, and serves the patched game when it exists:
 
 ```text
 http://localhost:8787/api/sessions/<session_id>/game/
 ```
+
+After saving a mapping, generate a line-level patch plan with:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8787/api/sessions/<session_id>/plan-mapping
+Invoke-RestMethod http://localhost:8787/api/sessions/<session_id>/patch-plan
+```
+
+The plan does not modify source files. It lists exact `file`, `line`,
+`before`, and `after` values for the user to review. Planned replacements wrap
+the original keyboard predicate and pass it into `gestureForge.input.check`, so
+keyboard behavior is preserved while gesture predicates are composed in:
+
+```js
+if (gestureForge.input.check("jump", function gestureForgeOriginalPredicate() {
+  return me.input.isKeyPressed("jump");
+})) {
+```
+
+After user approval, apply it manually with:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8787/api/sessions/<session_id>/apply-mapping
+Invoke-RestMethod http://localhost:8787/api/sessions/<session_id>/patch-report
+```
+
+`apply-mapping` uses `patch-plan.json` when it exists. Each patch is applied
+only when `confidence >= 0.8`, the patch is not marked `"approved": false`, and
+the reviewed `before` text exactly matches the current source line. Mismatches
+are left unchanged and reported as `manual_review`.
+
+The planner and patcher are conservative. Unsupported languages or ambiguous
+targets are kept in `manual_review`; those are the cases where an AI-assisted
+planner or an engine-specific planner is needed.
 
 Analyze a game's source code and extract keyboard controls:
 

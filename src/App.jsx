@@ -1,42 +1,27 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-const acceptedGameTypes = ".zip,.exe,.html,.wasm,.gba,.nes,.gb,.gbc,.js";
+const acceptedGameTypes = ".zip";
+const apiBaseUrl = "http://localhost:8787";
+const handCameraStreamUrl = `${apiBaseUrl}/api/camera/video`;
 
-const defaultMappings = [
-  { gesture: "Swipe Left", key: "Move Left", command: "A" },
-  { gesture: "Swipe Right", key: "Move Right", command: "D" },
-  { gesture: "Open Palm", key: "Jump", command: "Space" },
-  { gesture: "Pinch", key: "Action", command: "Ctrl" },
-];
-
-const gesturePresets = [
+const indexGestureOptions = [
   {
-    id: "arcade",
-    name: "Arcade Move Set",
-    description: "Fast hand motions for platformers, fighters, and action games.",
-    mappings: defaultMappings,
+    id: "index_extend",
+    label: "Index Extend",
+    description: "Index finger straight",
+    pose: {
+      left: { thumb: 0, index: 100, middle: 0, ring: 0, pinky: 0 },
+      right: { thumb: 0, index: 100, middle: 0, ring: 0, pinky: 0 },
+    },
   },
   {
-    id: "racer",
-    name: "Racer Move Set",
-    description: "Tilt, pinch, and palm controls for driving games.",
-    mappings: [
-      { gesture: "Tilt Left", key: "Steer Left", command: "Left" },
-      { gesture: "Tilt Right", key: "Steer Right", command: "Right" },
-      { gesture: "Closed Fist", key: "Boost", command: "Shift" },
-      { gesture: "Open Palm", key: "Brake", command: "Space" },
-    ],
-  },
-  {
-    id: "caster",
-    name: "Spellcaster Set",
-    description: "Gesture combos for abilities, inventory, and quick actions.",
-    mappings: [
-      { gesture: "Circle Draw", key: "Special", command: "Q" },
-      { gesture: "Two Fingers", key: "Inventory", command: "I" },
-      { gesture: "Swipe Up", key: "Cast", command: "E" },
-      { gesture: "Pinch Hold", key: "Aim", command: "Right Mouse" },
-    ],
+    id: "index_fold",
+    label: "Index Fold",
+    description: "Index finger curled",
+    pose: {
+      left: { thumb: 0, index: 0, middle: 0, ring: 0, pinky: 0 },
+      right: { thumb: 0, index: 0, middle: 0, ring: 0, pinky: 0 },
+    },
   },
 ];
 
@@ -71,6 +56,81 @@ const handPosePresets = {
     pinky: 0,
   },
 };
+
+const emptyAnalysis = {
+  controls: [],
+  unresolved: [],
+};
+
+function sourceIdentity(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+
+  return [item.file ?? "", item.line ?? "", item.text ?? ""].join("::");
+}
+
+function mergeSourceLists(...lists) {
+  const seen = new Set();
+  const merged = [];
+
+  lists.flat().forEach((item) => {
+    const identity = sourceIdentity(item);
+
+    if (!identity || seen.has(identity)) {
+      return;
+    }
+
+    seen.add(identity);
+    merged.push(item);
+  });
+
+  return merged;
+}
+
+function dedupeAnalysisControls(nextAnalysis) {
+  const controls = Array.isArray(nextAnalysis?.controls) ? nextAnalysis.controls : [];
+  const mergedControls = [];
+  const byKey = new Map();
+
+  controls.forEach((control) => {
+    const action = String(control.action ?? control.id ?? "").trim().toLowerCase();
+    const key = String(control.key ?? "").trim().toLowerCase();
+    const code = String(control.code ?? "").trim().toLowerCase();
+    const dedupeKey = `${action}|${key}|${code}`;
+
+    if (!action && !key && !code) {
+      mergedControls.push(control);
+      return;
+    }
+
+    const existing = byKey.get(dedupeKey);
+
+    if (!existing) {
+      const copied = {
+        ...control,
+        usage_targets: mergeSourceLists(control.usage_targets ?? []),
+        evidence: mergeSourceLists(control.evidence ?? []),
+      };
+      byKey.set(dedupeKey, copied);
+      mergedControls.push(copied);
+      return;
+    }
+
+    existing.usage_targets = mergeSourceLists(existing.usage_targets ?? [], control.usage_targets ?? []);
+    existing.evidence = mergeSourceLists(existing.evidence ?? [], control.evidence ?? []);
+    existing.confidence = Math.max(Number(existing.confidence ?? 0), Number(control.confidence ?? 0));
+
+    if (!existing.binding_target && control.binding_target) {
+      existing.binding_target = control.binding_target;
+    }
+  });
+
+  return {
+    ...nextAnalysis,
+    controls: mergedControls,
+  };
+}
 
 function formatFileSize(bytes) {
   if (!bytes) {
@@ -107,15 +167,17 @@ function SettingsGlyph() {
   );
 }
 
-function StepTabs({ currentStep, onStepChange }) {
+function StepTabs({ currentStep, onStepChange, canOpenStep }) {
   return (
     <nav className="step-tabs" aria-label="Build steps">
       {["Upload Your Game", "Choose The Gesture", "Display"].map((label, index) => {
         const step = index + 1;
+        const isDisabled = !canOpenStep(step);
 
         return (
           <button
             className={`step-tab${currentStep === step ? " is-active" : ""}`}
+            disabled={isDisabled}
             key={label}
             type="button"
             onClick={() => onStepChange(step)}
@@ -240,22 +302,29 @@ function HandRig({ pose }) {
 
 function UploadPanel({
   selectedFile,
+  githubUrl,
   isDragging,
+  session,
+  sessionStatus,
+  errorMessage,
+  onGithubUrlChange,
   onFileChange,
   onDrop,
   onDragStateChange,
   onReset,
-  onNext,
+  onAnalyzeGithub,
+  onAnalyzeZip,
   fileInputRef,
 }) {
   const inputId = "game-file";
   const helperText = useMemo(() => {
     if (!selectedFile) {
-      return "ZIP, EXE, HTML, WASM, ROM, or JS build";
+      return "ZIP build or paste a GitHub source URL";
     }
 
-    return `${formatFileSize(selectedFile.size)} ready for gesture mapping`;
+    return `${formatFileSize(selectedFile.size)} ready for backend analysis`;
   }, [selectedFile]);
+  const isWorking = ["queued", "cloning", "extracting", "analyzing"].includes(sessionStatus);
 
   return (
     <section className="upload-panel">
@@ -264,6 +333,16 @@ function UploadPanel({
       <p className="intro">
         Drop in a game build and forge every keyboard action into a camera gesture.
       </p>
+
+      <div className="github-entry">
+        <span className="file-label">GitHub Source URL</span>
+        <input
+          placeholder="https://github.com/OWNER/REPO"
+          type="url"
+          value={githubUrl}
+          onChange={(event) => onGithubUrlChange(event.target.value)}
+        />
+      </div>
 
       <label
         className={`drop-zone${isDragging ? " is-dragging" : ""}`}
@@ -307,166 +386,333 @@ function UploadPanel({
       )}
 
       <div className="actions">
-        <button className="pixel-button" type="button" onClick={onNext}>
-          {selectedFile ? "Start Mapping" : "Continue"}
+        <button
+          className="pixel-button"
+          disabled={isWorking || !githubUrl.trim()}
+          type="button"
+          onClick={onAnalyzeGithub}
+        >
+          Analyze URL
+        </button>
+        <button
+          className="pixel-button secondary"
+          disabled={isWorking || !selectedFile}
+          type="button"
+          onClick={onAnalyzeZip}
+        >
+          Analyze ZIP
         </button>
         <button className="icon-button" type="button" aria-label="Open settings">
           <SettingsGlyph />
         </button>
       </div>
+
+      {(session || sessionStatus || errorMessage) && (
+        <div className="session-card">
+          <div className="board-title">
+            <span>{session?.session_id ? "Session Ready" : "Session Status"}</span>
+            <span className="mini-led">{sessionStatus || "IDLE"}</span>
+          </div>
+          {session?.session_id && <code>{session.session_id}</code>}
+          {isWorking && <p>Backend is preparing the source and extracting keyboard controls.</p>}
+          {errorMessage && <p className="error-text">{errorMessage}</p>}
+        </div>
+      )}
     </section>
   );
 }
 
-function ChooseGesturePanel({ selectedPresetId, onPresetChange, onBack, onNext }) {
-  const [handPose, setHandPose] = useState({
-    left: handPosePresets.fist,
-    right: handPosePresets.fist,
-  });
-
-  function updateFinger(hand, id, value) {
-    setHandPose((currentPose) => ({
-      ...currentPose,
-      [hand]: {
-        ...currentPose[hand],
-        [id]: value,
-      },
-    }));
-  }
-
-  function applyPose(hand, poseName) {
-    setHandPose((currentPose) => ({
-      ...currentPose,
-      [hand]: handPosePresets[poseName],
-    }));
-  }
-
-  function renderControlBoard(hand, label) {
-    return (
-      <div className="control-board" aria-label={`${label} finger control board`}>
-        <div className="board-title">
-          <span>{label}</span>
-          <span className="mini-led">CONTROL</span>
-        </div>
-
-        <div className="pose-buttons" aria-label={`${label} quick hand poses`}>
-          <button type="button" onClick={() => applyPose(hand, "open")}>
-            Open
-          </button>
-          <button type="button" onClick={() => applyPose(hand, "fist")}>
-            Fist
-          </button>
-          <button type="button" onClick={() => applyPose(hand, "peace")}>
-            Peace
-          </button>
-        </div>
-
-        <div className="finger-controls">
-          {fingerControls.map((finger) => (
-            <FingerSlider
-              id={finger.id}
-              key={finger.id}
-              label={finger.label}
-              value={handPose[hand][finger.id]}
-              onChange={(id, value) => updateFinger(hand, id, value)}
-            />
-          ))}
-        </div>
-      </div>
-    );
-  }
+function ChooseGesturePanel({
+  analysis,
+  mappings,
+  patchReport,
+  isPlanningPatch,
+  isApplyingPatch,
+  patchApplyError,
+  onMappingChange,
+  onBack,
+  onPlan,
+  onApplyPlan,
+  onDisplay,
+}) {
+  const controls = analysis?.controls ?? [];
+  const previewGesture = indexGestureOptions.find((option) => option.id === Object.values(mappings)[0]);
+  const previewPose = previewGesture?.pose ?? indexGestureOptions[0].pose;
+  const patchStatus = patchReport?.status;
+  const plannedPatches = patchReport?.patches?.length ?? 0;
+  const runtimeInjections = patchReport?.runtime_injections?.length ?? 0;
+  const manualReviewCount = patchReport?.manual_review?.length ?? 0;
+  const canApplyPlan = plannedPatches > 0 || runtimeInjections > 0;
+  const gestureConflicts = indexGestureOptions
+    .map((gesture) => ({
+      gesture,
+      controls: controls.filter((control) => mappings[control.id] === gesture.id),
+    }))
+    .filter((group) => group.controls.length > 1);
 
   return (
     <section className="stage-panel gesture-stage">
       <p className="eyebrow">Level 02</p>
       <h1 id="page-title">CHOOSE THE GESTURE</h1>
       <p className="intro">
-        Pick the gesture language that will replace the game's keyboard controls.
+        Assign each detected keyboard control to an index finger gesture.
       </p>
 
-      <div className="gesture-lab">
-        {renderControlBoard("left", "Left Hand")}
-        <HandRig pose={handPose} />
-        {renderControlBoard("right", "Right Hand")}
-      </div>
+      <div className="mapping-workbench">
+        <div className="control-list" aria-label="Detected keyboard controls">
+          <div className="board-title">
+            <span>Detected Controls</span>
+            <span className="mini-led">{controls.length} FOUND</span>
+          </div>
+          {controls.map((control, index) => {
+            const selectedGesture = mappings[control.id] ?? indexGestureOptions[index % indexGestureOptions.length].id;
 
-      <div className="preset-grid" role="radiogroup" aria-label="Gesture presets">
-        {gesturePresets.map((preset) => (
-          <button
-            className={`preset-card${selectedPresetId === preset.id ? " is-selected" : ""}`}
-            key={preset.id}
-            type="button"
-            role="radio"
-            aria-checked={selectedPresetId === preset.id}
-            onClick={() => onPresetChange(preset.id)}
-          >
-            <span className="preset-pixels" aria-hidden="true">
-              <span />
-              <span />
-              <span />
-            </span>
-            <strong>{preset.name}</strong>
-            <span>{preset.description}</span>
-          </button>
-        ))}
+            return (
+              <div className="control-map-row" key={control.id}>
+                <div>
+                  <strong>{control.action}</strong>
+                  <span>
+                    {control.key} / {control.code}
+                  </span>
+                </div>
+                <div className="gesture-choice" role="group" aria-label={`${control.action} gesture`}>
+                  {indexGestureOptions.map((option) => (
+                    <button
+                      className={selectedGesture === option.id ? "is-active" : ""}
+                      key={option.id}
+                      type="button"
+                      onClick={() => onMappingChange(control.id, option.id)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          {!controls.length && (
+            <div className="empty-state">
+              <strong>No controls detected</strong>
+              <span>Run backend analysis before mapping gestures.</span>
+            </div>
+          )}
+        </div>
+
+        <HandRig pose={previewPose} />
       </div>
 
       <div className="actions">
         <button className="pixel-button secondary" type="button" onClick={onBack}>
           Back
         </button>
-        <button className="pixel-button" type="button" onClick={onNext}>
-          Display
+        <button className="pixel-button secondary" disabled={!controls.length || isPlanningPatch} type="button" onClick={onPlan}>
+          {isPlanningPatch ? "Planning" : patchStatus === "planned" ? "Update Plan" : "Create Plan"}
         </button>
+        {patchStatus === "planned" ? (
+          <button className="pixel-button" disabled={isApplyingPatch || !canApplyPlan} type="button" onClick={onApplyPlan}>
+            {isApplyingPatch ? "Applying" : "Apply Plan"}
+          </button>
+        ) : null}
+        {patchStatus === "patched" ? (
+          <button className="pixel-button" type="button" onClick={onDisplay}>
+            Display
+          </button>
+        ) : null}
       </div>
+
+      {gestureConflicts.length > 0 && (
+        <div className="gesture-plan-card is-warning">
+          <div className="board-title">
+            <span>Gesture Conflict</span>
+            <span className="mini-led">CHECK</span>
+          </div>
+          {gestureConflicts.map((group) => (
+            <p className="patch-note" key={group.gesture.id}>
+              {group.gesture.label}: {group.controls.map((control) => control.action).join(" + ")}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {(patchReport || patchApplyError) && (
+        <div className="gesture-plan-card">
+          <div className="board-title">
+            <span>Patch Plan</span>
+            <span className="mini-led">{patchStatus === "patched" ? "APPLIED" : patchStatus === "planned" ? "READY" : "CHECK"}</span>
+          </div>
+          {patchStatus === "planned" && (
+            <p className="patch-note">
+              {plannedPatches} line changes ready, {runtimeInjections} runtime injection{runtimeInjections === 1 ? "" : "s"}
+              {manualReviewCount ? `, ${manualReviewCount} need review` : ""}.
+            </p>
+          )}
+          {patchStatus === "patched" && <p className="patch-note">Patched game is ready for display.</p>}
+          {patchStatus === "plan_failed" && <p className="patch-note">{patchReport.error || "Plan failed."}</p>}
+          {patchApplyError && <p className="patch-note">{patchApplyError}</p>}
+        </div>
+      )}
     </section>
   );
 }
 
-function DisplayPanel({ selectedFile, selectedPreset, onBack, onRestart }) {
-  const fileName = selectedFile?.name ?? "Demo Game Build";
+function CameraPreview() {
+  const [streamReady, setStreamReady] = useState(false);
+  const [streamUrl, setStreamUrl] = useState("");
+  const [cameraStatus, setCameraStatus] = useState("STARTING CAMERA");
+
+  useEffect(() => {
+    let isMounted = true;
+    let retryTimer;
+
+    async function startCamera() {
+      try {
+        setCameraStatus("STARTING CAMERA");
+        const response = await fetch(`${apiBaseUrl}/api/camera/start`);
+        const payload = await response.json();
+
+        if (!response.ok) {
+          throw new Error(payload.error || "Camera failed to start.");
+        }
+
+        if (isMounted) {
+          setCameraStatus("CAMERA STREAM");
+          setStreamUrl(`${handCameraStreamUrl}?t=${Date.now()}`);
+        }
+      } catch (error) {
+        if (isMounted) {
+          setStreamReady(false);
+          setCameraStatus(error.message);
+          retryTimer = window.setTimeout(startCamera, 2500);
+        }
+      }
+    }
+
+    startCamera();
+
+    return () => {
+      isMounted = false;
+
+      if (retryTimer) {
+        window.clearTimeout(retryTimer);
+      }
+    };
+  }, []);
 
   return (
-    <section className="stage-panel wide-panel">
-      <p className="eyebrow">Level 03</p>
-      <h1 id="page-title">DISPLAY</h1>
-      <p className="intro">
-        Your game is now shown with the selected gesture control layer.
-      </p>
+    <div className="camera-preview">
+      {streamUrl && (
+        <img
+          alt="Live hand skeleton"
+          src={streamUrl}
+          onLoad={() => setStreamReady(true)}
+          onError={() => {
+            setStreamReady(false);
+            setCameraStatus("CAMERA RETRY");
+            setStreamUrl(`${handCameraStreamUrl}?t=${Date.now()}`);
+          }}
+        />
+      )}
+      <div className="camera-hud">
+        <span className="status-light" aria-hidden="true" />
+        {streamReady ? "CAMERA ON / INDEX STATE" : cameraStatus}
+      </div>
+    </div>
+  );
+}
 
-      <div className="display-grid">
-        <div className="game-window" aria-label="Game display mockup">
-          <div className="game-hud">
-            <span>{fileName}</span>
-            <span>GESTURE ON</span>
-          </div>
-          <div className="pixel-stage" aria-hidden="true">
-            <span className="hero-sprite" />
-            <span className="platform one" />
-            <span className="platform two" />
-            <span className="coin one" />
-            <span className="coin two" />
-            <span className="coin three" />
-          </div>
+function DisplayPanel({
+  mappings,
+  analysis,
+  session,
+  patchReport,
+  onBack,
+  onRestart,
+}) {
+  const gameFrameRef = useRef(null);
+  const controls = analysis?.controls ?? [];
+  const gameUrl = session?.game_url ? `${apiBaseUrl}${session.game_url}` : "";
+  const patchStatus = patchReport?.status;
+
+  useEffect(() => {
+    let isMounted = true;
+    let timer;
+
+    async function pollGestureState() {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/camera/state`, { cache: "no-store" });
+        const state = await response.json();
+        const target = gameFrameRef.current?.contentWindow;
+
+        if (target?.gestureForge?.setState) {
+          target.gestureForge.setState({
+            indexExtended: Boolean(state.indexExtended),
+            indexFolded: Boolean(state.indexFolded),
+          });
+        }
+      } catch {
+      } finally {
+        if (isMounted) {
+          timer = window.setTimeout(pollGestureState, 80);
+        }
+      }
+    }
+
+    pollGestureState();
+
+    return () => {
+      isMounted = false;
+
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, []);
+
+  return (
+    <section className="play-mode" aria-label="GestureForge play mode">
+      {gameUrl ? (
+        <iframe ref={gameFrameRef} className="play-game-frame" src={gameUrl} title="Session game display" />
+      ) : (
+        <div className="play-fallback" aria-hidden="true">
+          <span className="hero-sprite" />
+          <span className="platform one" />
+          <span className="platform two" />
         </div>
+      )}
 
-        <div className="summary-board">
-          <div className="board-title">
-            <span>{selectedPreset.name}</span>
-            <span className="mini-led">ACTIVE</span>
-          </div>
-          {selectedPreset.mappings.map((mapping) => (
-            <div className="mapping-row" key={`${mapping.gesture}-${mapping.command}`}>
-              <span>{mapping.gesture}</span>
-              <kbd>{mapping.command}</kbd>
+      <CameraPreview />
+
+      <div className="play-map-overlay" aria-label="Active gesture mappings">
+        <div className="board-title">
+          <span>Index Map</span>
+          <span className="mini-led">{patchStatus === "planned" ? "REVIEW" : patchStatus === "patched" ? "PATCHED" : "LIVE"}</span>
+        </div>
+        {patchStatus === "patched" && <p className="patch-note">Patched game is running.</p>}
+        {patchStatus === "plan_failed" && <p className="patch-note">Plan failed. Showing original game.</p>}
+        <div className="play-map-list">
+          {controls.map((control) => {
+            const gestureId = mappings[control.id];
+            const gesture = indexGestureOptions.find((option) => option.id === gestureId);
+
+            return (
+              <div className="play-map-row" key={control.id}>
+                <span>{control.action}</span>
+                <kbd>{gesture?.label ?? "Unmapped"}</kbd>
+              </div>
+            );
+          })}
+          {!controls.length && (
+            <div className="play-map-row">
+              <span>No controls</span>
+              <kbd>--</kbd>
             </div>
-          ))}
+          )}
         </div>
       </div>
 
-      <div className="actions">
+      <div className="play-actions">
         <button className="pixel-button secondary" type="button" onClick={onBack}>
-          Back
+          Map
         </button>
         <button className="pixel-button" type="button" onClick={onRestart}>
           New Game
@@ -476,7 +722,9 @@ function DisplayPanel({ selectedFile, selectedPreset, onBack, onRestart }) {
   );
 }
 
-function GesturePreview({ selectedPreset }) {
+function GesturePreview({ mappings, analysis }) {
+  const controls = analysis?.controls ?? [];
+
   return (
     <aside className="preview-panel" aria-label="Gesture control preview">
       <div className="arcade-frame">
@@ -490,12 +738,22 @@ function GesturePreview({ selectedPreset }) {
           <span>Gesture Map</span>
           <span className="mini-led">LIVE</span>
         </div>
-        {selectedPreset.mappings.map((mapping) => (
-          <div className="mapping-row" key={mapping.gesture}>
-            <span>{mapping.gesture}</span>
-            <kbd>{mapping.command}</kbd>
+        {controls.slice(0, 4).map((control) => {
+          const gesture = indexGestureOptions.find((option) => option.id === mappings[control.id]);
+
+          return (
+            <div className="mapping-row" key={control.id}>
+              <span>{control.action}</span>
+              <kbd>{gesture?.label ?? control.key}</kbd>
+            </div>
+          );
+        })}
+        {!controls.length && (
+          <div className="mapping-row">
+            <span>Index Extend</span>
+            <kbd>Ready</kbd>
           </div>
-        ))}
+        )}
       </div>
     </aside>
   );
@@ -504,14 +762,213 @@ function GesturePreview({ selectedPreset }) {
 export default function App() {
   const fileInputRef = useRef(null);
   const [selectedFile, setSelectedFile] = useState(null);
+  const [githubUrl, setGithubUrl] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [currentStep, setCurrentStep] = useState(1);
-  const [selectedPresetId, setSelectedPresetId] = useState(gesturePresets[0].id);
+  const [analysis, setAnalysis] = useState(emptyAnalysis);
+  const [session, setSession] = useState(null);
+  const [sessionStatus, setSessionStatus] = useState("");
+  const [mappings, setMappings] = useState({});
+  const [errorMessage, setErrorMessage] = useState("");
+  const [patchReport, setPatchReport] = useState(null);
+  const [isPlanningPatch, setIsPlanningPatch] = useState(false);
+  const [isApplyingPatch, setIsApplyingPatch] = useState(false);
+  const [patchApplyError, setPatchApplyError] = useState("");
 
-  const selectedPreset = useMemo(
-    () => gesturePresets.find((preset) => preset.id === selectedPresetId) ?? gesturePresets[0],
-    [selectedPresetId],
-  );
+  function applyAnalysis(nextSession, nextAnalysis) {
+    const dedupedAnalysis = dedupeAnalysisControls(nextAnalysis);
+    const nextMappings = Object.fromEntries(
+      (dedupedAnalysis.controls ?? []).map((control, index) => [
+        control.id,
+        indexGestureOptions[index % indexGestureOptions.length].id,
+      ]),
+    );
+
+    setSession(nextSession);
+    setAnalysis(dedupedAnalysis);
+    setMappings(nextMappings);
+    setPatchReport(null);
+    setPatchApplyError("");
+    setCurrentStep(2);
+  }
+
+  async function pollSession(sessionId) {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < 240000) {
+      const statusResponse = await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`);
+      const statusPayload = await statusResponse.json();
+      setSessionStatus(statusPayload.status);
+
+      if (statusPayload.status === "failed") {
+        throw new Error(statusPayload.hint || statusPayload.error || "Session analysis failed.");
+      }
+
+      if (statusPayload.status === "ready") {
+        const analysisResponse = await fetch(`${apiBaseUrl}/api/sessions/${sessionId}/analysis`);
+        const nextAnalysis = await analysisResponse.json();
+        applyAnalysis(statusPayload, nextAnalysis);
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 2200));
+    }
+
+    throw new Error("Backend analysis timed out.");
+  }
+
+  async function createGithubSession() {
+    setErrorMessage("");
+    setSessionStatus("queued");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/sessions/github`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ github_url: githubUrl.trim() }),
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Could not create GitHub session.");
+      }
+
+      setSession(payload);
+      await pollSession(payload.session_id);
+    } catch (error) {
+      setSessionStatus("failed");
+      setErrorMessage(error.message);
+    }
+  }
+
+  async function createZipSession() {
+    if (!selectedFile) {
+      return;
+    }
+
+    setErrorMessage("");
+    setSessionStatus("queued");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/sessions/zip`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/zip",
+          "X-Filename": selectedFile.name,
+        },
+        body: selectedFile,
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Could not create ZIP session.");
+      }
+
+      setSession(payload);
+      await pollSession(payload.session_id);
+    } catch (error) {
+      setSessionStatus("failed");
+      setErrorMessage(error.message);
+    }
+  }
+
+  async function saveMappingAndPlan() {
+    if (!session?.session_id) {
+      return;
+    }
+
+    const payload = {
+      session_id: session.session_id,
+      version: 1,
+      controls: (analysis.controls ?? []).map((control) => {
+        const gestureId = mappings[control.id];
+        const gesture = indexGestureOptions.find((option) => option.id === gestureId);
+
+        return {
+          control_id: control.id,
+          key: control.key,
+          code: control.code,
+          action: control.action,
+          gesture: gesture?.id ?? gestureId,
+          gesture_label: gesture?.label ?? gestureId,
+          suggested_function: control.suggested_function,
+          binding_target: control.binding_target,
+          usage_targets: control.usage_targets ?? [],
+        };
+      }),
+    };
+
+    setErrorMessage("");
+    setPatchApplyError("");
+    setIsPlanningPatch(true);
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/sessions/${session.session_id}/mapping`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const errorPayload = await response.json();
+        throw new Error(errorPayload.error || "Could not save mapping.");
+      }
+
+      const patchResponse = await fetch(`${apiBaseUrl}/api/sessions/${session.session_id}/plan-mapping`, {
+        method: "POST",
+      });
+      const patchPayload = await patchResponse.json();
+
+      setPatchReport(
+        patchResponse.ok
+          ? patchPayload.plan
+          : {
+              status: "plan_failed",
+              error: patchPayload.error || "Could not plan game control changes.",
+              patches: [],
+            },
+      );
+      setSession((currentSession) => ({
+        ...currentSession,
+        game_url: patchPayload.game_url ?? currentSession?.game_url,
+      }));
+    } catch (error) {
+      setErrorMessage(error.message);
+    } finally {
+      setIsPlanningPatch(false);
+    }
+  }
+
+  async function applyConfirmedPatchPlan() {
+    if (!session?.session_id) {
+      return;
+    }
+
+    setIsApplyingPatch(true);
+    setPatchApplyError("");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/sessions/${session.session_id}/apply-mapping`, {
+        method: "POST",
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Could not apply patch plan.");
+      }
+
+      setPatchReport(payload.report);
+      setSession((currentSession) => ({
+        ...currentSession,
+        game_url: `${payload.game_url ?? currentSession?.game_url}?patched=${Date.now()}`,
+      }));
+      setCurrentStep(3);
+    } catch (error) {
+      setPatchApplyError(error.message);
+    } finally {
+      setIsApplyingPatch(false);
+    }
+  }
 
   function updateSelectedFile(file) {
     setSelectedFile(file ?? null);
@@ -529,6 +986,15 @@ export default function App() {
 
   function handleReset() {
     updateSelectedFile(null);
+    setGithubUrl("");
+    setAnalysis(emptyAnalysis);
+    setSession(null);
+    setSessionStatus("");
+    setMappings({});
+    setPatchReport(null);
+    setIsApplyingPatch(false);
+    setPatchApplyError("");
+    setErrorMessage("");
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -537,18 +1003,45 @@ export default function App() {
 
   function handleRestart() {
     handleReset();
-    setSelectedPresetId(gesturePresets[0].id);
     setCurrentStep(1);
+  }
+
+  function updateMapping(controlId, gestureId) {
+    setMappings((currentMappings) => ({
+      ...currentMappings,
+      [controlId]: gestureId,
+    }));
+    setPatchReport(null);
+    setPatchApplyError("");
+  }
+
+  function canOpenStep(step) {
+    if (step === 1) {
+      return true;
+    }
+
+    if (step === 2) {
+      return Boolean(analysis.controls?.length);
+    }
+
+    return Boolean(session?.session_id && analysis.controls?.length && patchReport?.status === "patched");
   }
 
   function renderStep() {
     if (currentStep === 2) {
       return (
         <ChooseGesturePanel
-          selectedPresetId={selectedPresetId}
-          onPresetChange={setSelectedPresetId}
+          analysis={analysis}
+          isApplyingPatch={isApplyingPatch}
+          isPlanningPatch={isPlanningPatch}
+          mappings={mappings}
+          onMappingChange={updateMapping}
+          onApplyPlan={applyConfirmedPatchPlan}
           onBack={() => setCurrentStep(1)}
-          onNext={() => setCurrentStep(3)}
+          onDisplay={() => setCurrentStep(3)}
+          onPlan={saveMappingAndPlan}
+          patchApplyError={patchApplyError}
+          patchReport={patchReport}
         />
       );
     }
@@ -556,8 +1049,10 @@ export default function App() {
     if (currentStep === 3) {
       return (
         <DisplayPanel
-          selectedFile={selectedFile}
-          selectedPreset={selectedPreset}
+          analysis={analysis}
+          mappings={mappings}
+          patchReport={patchReport}
+          session={session}
           onBack={() => setCurrentStep(2)}
           onRestart={handleRestart}
         />
@@ -567,15 +1062,25 @@ export default function App() {
     return (
       <UploadPanel
         selectedFile={selectedFile}
+        githubUrl={githubUrl}
         isDragging={isDragging}
+        session={session}
+        sessionStatus={sessionStatus}
+        errorMessage={errorMessage}
+        onGithubUrlChange={setGithubUrl}
         onFileChange={handleFileChange}
         onDrop={handleDrop}
         onDragStateChange={setIsDragging}
         onReset={handleReset}
-        onNext={() => setCurrentStep(2)}
+        onAnalyzeGithub={createGithubSession}
+        onAnalyzeZip={createZipSession}
         fileInputRef={fileInputRef}
       />
     );
+  }
+
+  if (currentStep === 3) {
+    return renderStep();
   }
 
   return (
@@ -592,11 +1097,11 @@ export default function App() {
           </div>
         </div>
 
-        <StepTabs currentStep={currentStep} onStepChange={setCurrentStep} />
+        <StepTabs currentStep={currentStep} onStepChange={setCurrentStep} canOpenStep={canOpenStep} />
 
         <div className={`hero-grid${currentStep === 2 ? " gesture-editor-grid" : ""}`}>
           {renderStep()}
-          {currentStep !== 2 && <GesturePreview selectedPreset={selectedPreset} />}
+          {currentStep !== 2 && <GesturePreview analysis={analysis} mappings={mappings} />}
         </div>
       </section>
     </main>
