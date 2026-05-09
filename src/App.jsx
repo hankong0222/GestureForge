@@ -4,6 +4,14 @@ const acceptedGameTypes = ".zip";
 const apiBaseUrl = "http://localhost:8787";
 const handCameraStreamUrl = `${apiBaseUrl}/api/camera/video`;
 const savedStateKey = "gestureforge.uiState.v1";
+const recordingMimeTypes = [
+  "video/webm;codecs=vp9",
+  "video/webm;codecs=vp8",
+  "video/webm",
+];
+const cloudinaryCloudName = (import.meta.env.VITE_CLOUDINARY_CLOUD_NAME ?? "").trim();
+const cloudinaryUploadPreset = (import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET ?? "").trim();
+const cloudinaryUploadFolder = (import.meta.env.VITE_CLOUDINARY_FOLDER ?? "").trim();
 
 const fingerControls = [
   { id: "thumb", label: "Thumb" },
@@ -169,6 +177,65 @@ function formatFileSize(bytes) {
   return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.round(Number(ms || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function supportedRecordingMimeType() {
+  if (typeof MediaRecorder === "undefined") {
+    return "";
+  }
+
+  return recordingMimeTypes.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
+}
+
+function cloudinaryStatusLabel(status) {
+  const labels = {
+    idle: "LOCAL",
+    unconfigured: "CONFIG",
+    uploading: "UPLOADING",
+    registering: "SYNCING",
+    stored: "STORED",
+    failed: "FAILED",
+    backend_failed: "BACKEND",
+  };
+
+  return labels[status] ?? "LOCAL";
+}
+
+function videoAnalysisStatusLabel(status) {
+  const labels = {
+    idle: "IDLE",
+    queued: "QUEUED",
+    analyzing: "ANALYZING",
+    partial: "PARTIAL",
+    complete: "READY",
+    failed: "FAILED",
+  };
+
+  return labels[status] ?? "IDLE";
+}
+
+function clipPlanStatusLabel(status) {
+  const labels = {
+    idle: "IDLE",
+    loading: "LOADING",
+    planned: "PLANNED",
+    stale: "STALE",
+    failed: "FAILED",
+  };
+
+  return labels[status] ?? "IDLE";
+}
+
+function formatSeconds(seconds) {
+  return formatDuration(Number(seconds || 0) * 1000);
+}
+
 function BrandMark() {
   return <span className="brand-mark" aria-hidden="true" />;
 }
@@ -192,10 +259,16 @@ function SettingsGlyph() {
   );
 }
 
+function RecordGlyph() {
+  return <span className="record-glyph" aria-hidden="true" />;
+}
+
 function StepTabs({ currentStep, onStepChange, canOpenStep }) {
+  const steps = ["Upload Your Game", "Choose The Gesture", "Display", "Recording Preview"];
+
   return (
     <nav className="step-tabs" aria-label="Build steps">
-      {["Upload Your Game", "Choose The Gesture", "Display"].map((label, index) => {
+      {steps.map((label, index) => {
         const step = index + 1;
         const isDisabled = !canOpenStep(step);
 
@@ -213,6 +286,60 @@ function StepTabs({ currentStep, onStepChange, canOpenStep }) {
         );
       })}
     </nav>
+  );
+}
+
+function RecordingControl({
+  recordedClip,
+  recordingError,
+  recordingStatus,
+  onPreviewRecording,
+  onStartRecording,
+  onStopRecording,
+}) {
+  const hasRecording = Boolean(recordedClip?.url);
+  const isRecording = recordingStatus === "recording";
+  const isRecordingBusy = recordingStatus === "starting" || recordingStatus === "stopping";
+  const recordingLabel = isRecording
+    ? "Recording"
+    : recordingStatus === "starting"
+      ? "Starting"
+      : recordingStatus === "stopping"
+        ? "Ending"
+        : hasRecording
+          ? "Clip Ready"
+          : "Screen Record";
+
+  return (
+    <div className={`recording-control${isRecording ? " is-recording" : ""}`} aria-label="Screen recording controls">
+      <div className="recording-status">
+        <span className="recording-dot" aria-hidden="true" />
+        <span>{recordingLabel}</span>
+      </div>
+      <div className="recording-buttons">
+        {isRecording ? (
+          <button className="pixel-button danger compact" type="button" onClick={onStopRecording}>
+            End
+          </button>
+        ) : (
+          <button
+            className="pixel-button compact"
+            disabled={isRecordingBusy}
+            type="button"
+            onClick={onStartRecording}
+          >
+            <RecordGlyph />
+            Rec
+          </button>
+        )}
+        {hasRecording && !isRecording ? (
+          <button className="pixel-button secondary compact" type="button" onClick={onPreviewRecording}>
+            Preview
+          </button>
+        ) : null}
+      </div>
+      {recordingError && <p className="recording-error">{recordingError}</p>}
+    </div>
   );
 }
 
@@ -805,6 +932,217 @@ function DisplayPanel({
   );
 }
 
+function RecordingPreviewPanel({
+  cloudinaryAsset,
+  cloudinaryError,
+  cloudinaryStatus,
+  recordedClip,
+  videoAnalysis,
+  videoAnalysisError,
+  videoAnalysisStatus,
+  clipPlan,
+  clipPlanError,
+  clipPlanStatus,
+  analysisFeedback,
+  analysisPrompt,
+  isSavingAnalysisFeedback,
+  onBack,
+  onFeedbackChange,
+  onPromptChange,
+  onRestart,
+  onSubmitFeedback,
+}) {
+  const transcriptSegments = videoAnalysis?.transcription?.segments ?? [];
+  const audioEvents = videoAnalysis?.audio?.events ?? [];
+  const highlights = videoAnalysis?.highlights ?? videoAnalysis?.multimodal?.funny_moments ?? [];
+  const plannedClips = clipPlan?.sequence?.clips ?? [];
+
+  return (
+    <section className="recording-preview-panel" aria-label="Recording preview">
+      <p className="eyebrow">Level 04</p>
+      <h1 id="page-title">RECORDING PREVIEW</h1>
+      <p className="intro">
+        Review the last captured play session, then jump back into display mode when you are ready.
+      </p>
+
+      {recordedClip?.url ? (
+        <div className="recording-preview-grid">
+          <div className="recording-player">
+            <video src={recordedClip.url} controls autoPlay />
+          </div>
+          <aside className="recording-summary">
+            <div className="board-title">
+              <span>Clip Details</span>
+              <span className="mini-led">{formatDuration(recordedClip.durationMs)}</span>
+            </div>
+            <div className="play-map-row">
+              <span>Format</span>
+              <kbd>{recordedClip.type || "webm"}</kbd>
+            </div>
+            <div className="play-map-row">
+              <span>Size</span>
+              <kbd>{formatFileSize(recordedClip.size)}</kbd>
+            </div>
+            <div className="play-map-row">
+              <span>Created</span>
+              <kbd>{new Date(recordedClip.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</kbd>
+            </div>
+            <a className="pixel-button secondary download-link" href={recordedClip.url} download={recordedClip.name}>
+              Download
+            </a>
+            <div className="cloudinary-board">
+              <div className="board-title">
+                <span>Cloudinary</span>
+                <span className="mini-led">{cloudinaryStatusLabel(cloudinaryStatus)}</span>
+              </div>
+              {cloudinaryAsset?.public_id && (
+                <div className="play-map-row">
+                  <span>Public ID</span>
+                  <kbd>{cloudinaryAsset.public_id}</kbd>
+                </div>
+              )}
+              {cloudinaryAsset?.video_url && (
+                <a className="cloudinary-link" href={cloudinaryAsset.video_url} target="_blank" rel="noreferrer">
+                  Cloudinary Source
+                </a>
+              )}
+              {cloudinaryError && <p className="recording-error">{cloudinaryError}</p>}
+            </div>
+          </aside>
+        </div>
+      ) : (
+        <div className="recording-empty">
+          <strong>No recording yet</strong>
+          <span>Start a recording from the floating control first.</span>
+        </div>
+      )}
+
+      <div className="actions">
+        <button className="pixel-button secondary" type="button" onClick={onBack}>
+          Back
+        </button>
+        <button className="pixel-button" type="button" onClick={onRestart}>
+          New Game
+        </button>
+      </div>
+
+      <div className="video-analysis-board" aria-label="AI video analysis">
+        <div className="board-title">
+          <span>AI Video Analysis</span>
+          <span className="mini-led">{videoAnalysisStatusLabel(videoAnalysisStatus)}</span>
+        </div>
+        {videoAnalysisError && <p className="recording-error">{videoAnalysisError}</p>}
+        {videoAnalysis?.errors?.length ? (
+          <p className="patch-note">{videoAnalysis.errors.slice(0, 2).join(" / ")}</p>
+        ) : null}
+
+        <div className="analysis-feedback-panel">
+          <label>
+            <span>Preference Prompt</span>
+            <textarea
+              placeholder="Example: prioritize absurd fails, keep clips under 6 seconds, ignore quiet setup."
+              value={analysisPrompt}
+              onChange={(event) => onPromptChange(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>Feedback</span>
+            <textarea
+              placeholder="Example: this missed the funniest scream; next time score loud reactions higher."
+              value={analysisFeedback}
+              onChange={(event) => onFeedbackChange(event.target.value)}
+            />
+          </label>
+          <button
+            className="pixel-button secondary"
+            disabled={isSavingAnalysisFeedback || !cloudinaryAsset?.backend_recording_id}
+            type="button"
+            onClick={onSubmitFeedback}
+          >
+            {isSavingAnalysisFeedback ? "Applying" : "Remember + Reanalyze"}
+          </button>
+        </div>
+
+        <div className="analysis-columns">
+          <section className="analysis-column">
+            <h2>Whisper Transcript</h2>
+            {transcriptSegments.slice(0, 5).map((segment) => (
+              <div className="analysis-row" key={`${segment.start}-${segment.end}-${segment.text}`}>
+                <kbd>{formatSeconds(segment.start)}</kbd>
+                <span>{segment.text}</span>
+              </div>
+            ))}
+            {!transcriptSegments.length && <p className="analysis-empty">Waiting for transcript.</p>}
+          </section>
+
+          <section className="analysis-column">
+            <h2>Audio Signals</h2>
+            {audioEvents.slice(0, 6).map((event) => (
+              <div className="analysis-row" key={`${event.label}-${event.start}-${event.end}`}>
+                <kbd>{formatSeconds(event.start)}</kbd>
+                <span>{String(event.label || "audio").replaceAll("_", " ")}</span>
+              </div>
+            ))}
+            {!audioEvents.length && <p className="analysis-empty">No audio events yet.</p>}
+          </section>
+
+          <section className="analysis-column">
+            <h2>Funny Moments</h2>
+            {highlights.slice(0, 5).map((moment) => (
+              <div className="analysis-card" key={`${moment.start}-${moment.end}-${moment.title}`}>
+                <div>
+                  <strong>{moment.title || "Funny Moment"}</strong>
+                  <span>{formatSeconds(moment.start)} - {formatSeconds(moment.end)}</span>
+                </div>
+                <p>{moment.reason || "Multimodal model flagged this segment."}</p>
+              </div>
+            ))}
+            {!highlights.length && <p className="analysis-empty">Waiting for multimodal judgment.</p>}
+          </section>
+        </div>
+      </div>
+
+      <div className="clip-plan-board" aria-label="Cloudinary clip plan">
+        <div className="board-title">
+          <span>Cloudinary Clip Plan</span>
+          <span className="mini-led">{clipPlanStatusLabel(clipPlanStatus)}</span>
+        </div>
+        {clipPlanError && <p className="recording-error">{clipPlanError}</p>}
+        {clipPlan?.output && (
+          <p className="patch-note">
+            {clipPlan.output.width}x{clipPlan.output.height} / {clipPlan.output.aspect_ratio} / {clipPlan.output.format}
+            {clipPlan.asset_policy?.allowed_asset_ids?.length ? ` / ${clipPlan.asset_policy.allowed_asset_ids.length} LOCAL ASSETS` : ""}
+          </p>
+        )}
+        <div className="clip-plan-list">
+          {plannedClips.map((clip) => (
+            <article className="clip-plan-card" key={clip.id}>
+              <div className="clip-plan-head">
+                <strong>{clip.overlays?.[0]?.text || clip.source_highlight?.title || clip.id}</strong>
+                <kbd>{formatSeconds(clip.trim?.start)} - {formatSeconds(clip.trim?.end)}</kbd>
+              </div>
+              <div className="clip-plan-grid">
+                <span>Trim {Number(clip.trim?.duration || 0).toFixed(1)}s</span>
+                <span>Crop {clip.crop?.aspect_ratio || "9:16"} {clip.crop?.width}x{clip.crop?.height}</span>
+                <span>Captions {clip.captions?.length || 0}</span>
+                <span>Audio {clip.audio_signals?.length || 0}</span>
+                <span>Zoom {clip.effects?.zoom?.enabled ? "on" : "off"}</span>
+                <span>Freeze {clip.effects?.freeze_frame?.enabled ? `${clip.effects.freeze_frame.duration}s` : "off"}</span>
+              </div>
+              <div className="clip-asset-row">
+                <span>Meme {clip.selected_assets?.meme || "none"}</span>
+                <span>Sound {clip.selected_assets?.sound || "none"}</span>
+              </div>
+              {clip.captions?.[0]?.text && <p>{clip.captions[0].text}</p>}
+            </article>
+          ))}
+          {!plannedClips.length && <p className="analysis-empty">Waiting for Backboard highlights to generate the edit plan.</p>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function GesturePreview({ mappings, analysis }) {
   const controls = analysis?.controls ?? [];
 
@@ -845,14 +1183,29 @@ function GesturePreview({ mappings, analysis }) {
 export default function App() {
   const savedUiState = useMemo(loadSavedUiState, []);
   const fileInputRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
+  const recordingStreamRef = useRef(null);
+  const recordingStartedAtRef = useRef(0);
+  const recordingClipUrlRef = useRef("");
+  const recordingCancelledRef = useRef(false);
+  const sessionRef = useRef(savedUiState.session ?? null);
   const [selectedFile, setSelectedFile] = useState(null);
   const [githubUrl, setGithubUrl] = useState(savedUiState.githubUrl ?? "");
   const [isDragging, setIsDragging] = useState(false);
-  const [currentStep, setCurrentStep] = useState(
-    savedUiState.currentStep === 3 && savedUiState.patchReport?.status !== "patched"
-      ? 2
-      : savedUiState.currentStep ?? 1,
-  );
+  const [currentStep, setCurrentStep] = useState(() => {
+    const restoredStep = savedUiState.currentStep ?? 1;
+
+    if (restoredStep === 3 && savedUiState.patchReport?.status !== "patched") {
+      return 2;
+    }
+
+    if (restoredStep === 4) {
+      return savedUiState.patchReport?.status === "patched" ? 3 : 2;
+    }
+
+    return restoredStep;
+  });
   const [analysis, setAnalysis] = useState(savedUiState.analysis ?? emptyAnalysis);
   const [session, setSession] = useState(savedUiState.session ?? null);
   const [sessionStatus, setSessionStatus] = useState(savedUiState.sessionStatus ?? "");
@@ -865,9 +1218,26 @@ export default function App() {
   const [isPlanningPatch, setIsPlanningPatch] = useState(false);
   const [isApplyingPatch, setIsApplyingPatch] = useState(false);
   const [patchApplyError, setPatchApplyError] = useState("");
+  const [recordingStatus, setRecordingStatus] = useState("idle");
+  const [recordingError, setRecordingError] = useState("");
+  const [recordedClip, setRecordedClip] = useState(null);
+  const [cloudinaryStatus, setCloudinaryStatus] = useState("idle");
+  const [cloudinaryError, setCloudinaryError] = useState("");
+  const [cloudinaryAsset, setCloudinaryAsset] = useState(null);
+  const [videoAnalysisStatus, setVideoAnalysisStatus] = useState("idle");
+  const [videoAnalysisError, setVideoAnalysisError] = useState("");
+  const [videoAnalysis, setVideoAnalysis] = useState(null);
+  const [clipPlanStatus, setClipPlanStatus] = useState("idle");
+  const [clipPlanError, setClipPlanError] = useState("");
+  const [clipPlan, setClipPlan] = useState(null);
+  const [analysisPrompt, setAnalysisPrompt] = useState("");
+  const [analysisFeedback, setAnalysisFeedback] = useState("");
+  const [isSavingAnalysisFeedback, setIsSavingAnalysisFeedback] = useState(false);
 
   useEffect(() => {
-    const safeStep = currentStep === 3 && patchReport?.status !== "patched" ? 2 : currentStep;
+    const safeStep = currentStep === 4
+      ? patchReport?.status === "patched" ? 3 : 2
+      : currentStep === 3 && patchReport?.status !== "patched" ? 2 : currentStep;
     window.localStorage.setItem(
       savedStateKey,
       JSON.stringify({
@@ -883,6 +1253,25 @@ export default function App() {
       }),
     );
   }, [githubUrl, currentStep, analysis, session, sessionStatus, mappings, draftMappings, selectedControlId, patchReport]);
+
+  useEffect(() => () => {
+    recordingCancelledRef.current = true;
+
+    if (recordingClipUrlRef.current) {
+      URL.revokeObjectURL(recordingClipUrlRef.current);
+    }
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+      return;
+    }
+
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+  }, []);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1138,6 +1527,341 @@ export default function App() {
     setSelectedFile(file ?? null);
   }
 
+  function stopRecordingTracks(stream = recordingStreamRef.current) {
+    stream?.getTracks().forEach((track) => {
+      track.onended = null;
+      track.stop();
+    });
+
+    if (stream === recordingStreamRef.current) {
+      recordingStreamRef.current = null;
+    }
+  }
+
+  function revokeRecordedClip() {
+    if (recordingClipUrlRef.current) {
+      URL.revokeObjectURL(recordingClipUrlRef.current);
+      recordingClipUrlRef.current = "";
+    }
+  }
+
+  function clearRecordedClip() {
+    revokeRecordedClip();
+    setRecordedClip(null);
+  }
+
+  async function registerCloudinaryRecording(asset, clip) {
+    const currentSession = sessionRef.current;
+    const response = await fetch(`${apiBaseUrl}/api/recordings/cloudinary`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        bytes: asset.bytes ?? clip.size,
+        duration: asset.duration ?? clip.durationMs / 1000,
+        format: asset.format,
+        height: asset.height,
+        original_filename: clip.name,
+        public_id: asset.public_id,
+        resource_type: asset.resource_type ?? "video",
+        session_id: currentSession?.session_id ?? null,
+        source: "gestureforge_screen_recording",
+        type: asset.type ?? clip.type,
+        video_url: asset.video_url,
+        width: asset.width,
+      }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(payload.error || "Backend could not store Cloudinary video metadata.");
+    }
+
+    return payload;
+  }
+
+  async function pollVideoAnalysis(recordingId) {
+    const startedAt = Date.now();
+    setVideoAnalysisStatus("queued");
+    setVideoAnalysisError("");
+    setVideoAnalysis(null);
+
+    while (Date.now() - startedAt < 900000) {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/recordings/${recordingId}/analysis`, {
+          cache: "no-store",
+        });
+        const payload = await response.json();
+
+        if (response.ok && payload.analysis) {
+          setVideoAnalysis(payload.analysis);
+          setVideoAnalysisStatus(payload.analysis_status || payload.analysis.status || "complete");
+          fetchClipPlan(recordingId);
+          return;
+        }
+
+        if (response.status === 500 || payload.analysis_status === "failed") {
+          throw new Error(payload.error || "Video analysis failed.");
+        }
+
+        setVideoAnalysisStatus(payload.analysis_status || "analyzing");
+      } catch (error) {
+        setVideoAnalysisStatus("failed");
+        setVideoAnalysisError(error.message);
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
+
+    setVideoAnalysisStatus("failed");
+    setVideoAnalysisError("Video analysis timed out.");
+  }
+
+  async function fetchClipPlan(recordingId) {
+    setClipPlanStatus("loading");
+    setClipPlanError("");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/recordings/${recordingId}/clip-plan`, {
+        cache: "no-store",
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Could not generate clip plan.");
+      }
+
+      setClipPlan(payload.plan);
+      setClipPlanStatus(payload.clip_plan_status || payload.plan?.status || "planned");
+    } catch (error) {
+      setClipPlanStatus("failed");
+      setClipPlanError(error.message);
+    }
+  }
+
+  async function submitVideoAnalysisFeedback() {
+    const recordingId = cloudinaryAsset?.backend_recording_id;
+
+    if (!recordingId) {
+      setVideoAnalysisError("Cloudinary recording must be stored before feedback can be applied.");
+      return;
+    }
+
+    setIsSavingAnalysisFeedback(true);
+    setVideoAnalysisError("");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/recordings/${recordingId}/feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: analysisPrompt,
+          feedback: analysisFeedback,
+        }),
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Could not save analysis feedback.");
+      }
+
+      setVideoAnalysis(null);
+      setClipPlan(null);
+      setClipPlanStatus("stale");
+      setClipPlanError("");
+      setVideoAnalysisStatus(payload.analysis_status || "queued");
+      pollVideoAnalysis(recordingId);
+    } catch (error) {
+      setVideoAnalysisStatus("failed");
+      setVideoAnalysisError(error.message);
+    } finally {
+      setIsSavingAnalysisFeedback(false);
+    }
+  }
+
+  async function uploadRecordingToCloudinary(clip) {
+    if (!cloudinaryCloudName || !cloudinaryUploadPreset) {
+      setCloudinaryStatus("unconfigured");
+      setCloudinaryError("Set VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET.");
+      return;
+    }
+
+    setCloudinaryStatus("uploading");
+    setCloudinaryError("");
+    setCloudinaryAsset(null);
+
+    let uploadedAsset = null;
+
+    try {
+      const formData = new FormData();
+      formData.append("file", clip.blob, clip.name);
+      formData.append("upload_preset", cloudinaryUploadPreset);
+      formData.append("tags", "gestureforge,screen-recording");
+
+      if (cloudinaryUploadFolder) {
+        formData.append("folder", cloudinaryUploadFolder);
+      }
+
+      const uploadResponse = await fetch(`https://api.cloudinary.com/v1_1/${cloudinaryCloudName}/video/upload`, {
+        method: "POST",
+        body: formData,
+      });
+      const uploadPayload = await uploadResponse.json();
+
+      if (!uploadResponse.ok) {
+        throw new Error(uploadPayload.error?.message || "Cloudinary upload failed.");
+      }
+
+      uploadedAsset = {
+        bytes: uploadPayload.bytes,
+        duration: uploadPayload.duration,
+        format: uploadPayload.format,
+        height: uploadPayload.height,
+        public_id: uploadPayload.public_id,
+        resource_type: uploadPayload.resource_type,
+        type: uploadPayload.type,
+        video_url: uploadPayload.secure_url || uploadPayload.url,
+        width: uploadPayload.width,
+      };
+
+      if (!uploadedAsset.public_id || !uploadedAsset.video_url) {
+        throw new Error("Cloudinary response did not include public_id or video URL.");
+      }
+
+      setCloudinaryAsset(uploadedAsset);
+      setCloudinaryStatus("registering");
+
+      const backendPayload = await registerCloudinaryRecording(uploadedAsset, clip);
+      setCloudinaryAsset({
+        ...uploadedAsset,
+        backend_recording_id: backendPayload.recording_id,
+      });
+      setCloudinaryStatus("stored");
+      pollVideoAnalysis(backendPayload.recording_id);
+    } catch (error) {
+      setCloudinaryError(error.message);
+      setCloudinaryStatus(uploadedAsset ? "backend_failed" : "failed");
+    }
+  }
+
+  async function startRecording() {
+    if (recordingStatus === "recording" || recordingStatus === "starting") {
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getDisplayMedia || typeof MediaRecorder === "undefined") {
+      setRecordingError("Screen recording is not supported in this browser.");
+      return;
+    }
+
+    setRecordingStatus("starting");
+    setRecordingError("");
+    setCloudinaryStatus("idle");
+    setCloudinaryError("");
+    setCloudinaryAsset(null);
+    setVideoAnalysisStatus("idle");
+    setVideoAnalysisError("");
+    setVideoAnalysis(null);
+    setClipPlanStatus("idle");
+    setClipPlanError("");
+    setClipPlan(null);
+    setAnalysisFeedback("");
+
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+      const mimeType = supportedRecordingMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
+      recordedChunksRef.current = [];
+      recordingCancelledRef.current = false;
+      recordingStartedAtRef.current = Date.now();
+      recordingStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data?.size) {
+          recordedChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onerror = (event) => {
+        setRecordingError(event.error?.message || "Recording failed.");
+        setRecordingStatus("idle");
+        stopRecordingTracks(stream);
+      };
+      recorder.onstop = () => {
+        const chunks = [...recordedChunksRef.current];
+        const durationMs = Date.now() - recordingStartedAtRef.current;
+
+        stopRecordingTracks(stream);
+        recordedChunksRef.current = [];
+        mediaRecorderRef.current = null;
+
+        if (recordingCancelledRef.current) {
+          setRecordingStatus("idle");
+          return;
+        }
+
+        if (!chunks.length) {
+          setRecordingError("No video data was captured.");
+          setRecordingStatus("idle");
+          return;
+        }
+
+        const blob = new Blob(chunks, { type: mimeType || chunks[0]?.type || "video/webm" });
+        const createdAt = new Date();
+        const url = URL.createObjectURL(blob);
+        const clip = {
+          blob,
+          createdAt: createdAt.toISOString(),
+          durationMs,
+          name: `gestureforge-recording-${createdAt.toISOString().replace(/[:.]/g, "-")}.webm`,
+          size: blob.size,
+          type: blob.type,
+          url,
+        };
+
+        revokeRecordedClip();
+        recordingClipUrlRef.current = url;
+        setRecordedClip(clip);
+        setRecordingStatus("ready");
+        setCurrentStep(4);
+        uploadRecordingToCloudinary(clip);
+      };
+
+      stream.getVideoTracks().forEach((track) => {
+        track.onended = () => {
+          if (mediaRecorderRef.current?.state === "recording") {
+            setRecordingStatus("stopping");
+            mediaRecorderRef.current.stop();
+          }
+        };
+      });
+
+      recorder.start(250);
+      setRecordingStatus("recording");
+    } catch (error) {
+      stopRecordingTracks();
+      setRecordingStatus("idle");
+      setRecordingError(error.name === "NotAllowedError" ? "Screen recording was cancelled." : error.message);
+    }
+  }
+
+  function stopRecording() {
+    const recorder = mediaRecorderRef.current;
+
+    if (!recorder || recorder.state === "inactive") {
+      setRecordingStatus(recordedClip?.url ? "ready" : "idle");
+      return;
+    }
+
+    setRecordingStatus("stopping");
+    recorder.requestData?.();
+    recorder.stop();
+  }
+
   function handleFileChange(event) {
     updateSelectedFile(event.target.files?.[0]);
   }
@@ -1149,6 +1873,7 @@ export default function App() {
   }
 
   function handleReset() {
+    clearRecordedClip();
     updateSelectedFile(null);
     setGithubUrl("");
     setAnalysis(emptyAnalysis);
@@ -1162,6 +1887,19 @@ export default function App() {
     setIsApplyingPatch(false);
     setPatchApplyError("");
     setErrorMessage("");
+    setRecordingError("");
+    setCloudinaryStatus("idle");
+    setCloudinaryError("");
+    setCloudinaryAsset(null);
+    setVideoAnalysisStatus("idle");
+    setVideoAnalysisError("");
+    setVideoAnalysis(null);
+    setClipPlanStatus("idle");
+    setClipPlanError("");
+    setClipPlan(null);
+    setAnalysisPrompt("");
+    setAnalysisFeedback("");
+    setIsSavingAnalysisFeedback(false);
     window.localStorage.removeItem(savedStateKey);
 
     if (fileInputRef.current) {
@@ -1211,7 +1949,15 @@ export default function App() {
       return Boolean(analysis.controls?.length);
     }
 
-    return Boolean(session?.session_id && analysis.controls?.length && patchReport?.status === "patched");
+    if (step === 3) {
+      return Boolean(session?.session_id && analysis.controls?.length && patchReport?.status === "patched");
+    }
+
+    if (step === 4) {
+      return Boolean(recordedClip?.url);
+    }
+
+    return false;
   }
 
   function renderStep() {
@@ -1251,6 +1997,31 @@ export default function App() {
       );
     }
 
+    if (currentStep === 4) {
+      return (
+        <RecordingPreviewPanel
+          cloudinaryAsset={cloudinaryAsset}
+          cloudinaryError={cloudinaryError}
+          cloudinaryStatus={cloudinaryStatus}
+          recordedClip={recordedClip}
+          videoAnalysis={videoAnalysis}
+          videoAnalysisError={videoAnalysisError}
+          videoAnalysisStatus={videoAnalysisStatus}
+          clipPlan={clipPlan}
+          clipPlanError={clipPlanError}
+          clipPlanStatus={clipPlanStatus}
+          analysisFeedback={analysisFeedback}
+          analysisPrompt={analysisPrompt}
+          isSavingAnalysisFeedback={isSavingAnalysisFeedback}
+          onBack={() => setCurrentStep(canOpenStep(3) ? 3 : analysis.controls?.length ? 2 : 1)}
+          onFeedbackChange={setAnalysisFeedback}
+          onPromptChange={setAnalysisPrompt}
+          onRestart={handleRestart}
+          onSubmitFeedback={submitVideoAnalysisFeedback}
+        />
+      );
+    }
+
     return (
       <UploadPanel
         selectedFile={selectedFile}
@@ -1271,31 +2042,50 @@ export default function App() {
     );
   }
 
+  const recordingOverlay = (
+    <RecordingControl
+      recordedClip={recordedClip}
+      recordingError={recordingError}
+      recordingStatus={recordingStatus}
+      onPreviewRecording={() => setCurrentStep(4)}
+      onStartRecording={startRecording}
+      onStopRecording={stopRecording}
+    />
+  );
+
   if (currentStep === 3) {
-    return renderStep();
+    return (
+      <>
+        {renderStep()}
+        {recordingOverlay}
+      </>
+    );
   }
 
   return (
-    <main className="app-shell">
-      <section className="screen" aria-labelledby="page-title">
-        <div className="top-bar">
-          <div className="brand">
-            <BrandMark />
-            <span>GestureForge</span>
+    <>
+      <main className="app-shell">
+        <section className="screen" aria-labelledby="page-title">
+          <div className="top-bar">
+            <div className="brand">
+              <BrandMark />
+              <span>GestureForge</span>
+            </div>
+            <div className="status-chip">
+              <span className="status-light" aria-hidden="true" />
+              Gesture Engine Ready
+            </div>
           </div>
-          <div className="status-chip">
-            <span className="status-light" aria-hidden="true" />
-            Gesture Engine Ready
+
+          <StepTabs currentStep={currentStep} onStepChange={setCurrentStep} canOpenStep={canOpenStep} />
+
+          <div className={`hero-grid${currentStep === 2 || currentStep === 4 ? " gesture-editor-grid" : ""}`}>
+            {renderStep()}
+            {currentStep !== 2 && currentStep !== 4 && <GesturePreview analysis={analysis} mappings={mappings} />}
           </div>
-        </div>
-
-        <StepTabs currentStep={currentStep} onStepChange={setCurrentStep} canOpenStep={canOpenStep} />
-
-        <div className={`hero-grid${currentStep === 2 ? " gesture-editor-grid" : ""}`}>
-          {renderStep()}
-          {currentStep !== 2 && <GesturePreview analysis={analysis} mappings={mappings} />}
-        </div>
-      </section>
-    </main>
+        </section>
+      </main>
+      {recordingOverlay}
+    </>
   );
 }

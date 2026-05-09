@@ -7,7 +7,10 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const rootDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const assetDir = resolve(rootDir, "asset");
 const sessionsDir = resolve(rootDir, "tmp", "sessions");
+const recordingsDir = resolve(rootDir, "tmp", "recordings");
+const backboardStatePath = resolve(rootDir, "tmp", "backboard-state.json");
 const defaultPort = Number(process.env.PORT ?? 8787);
 const pythonExecutable = process.env.PYTHON ?? "python";
 const cameraPort = Number(process.env.CAMERA_PORT ?? 8791);
@@ -20,7 +23,11 @@ const contentTypes = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
   ".json": "application/json; charset=utf-8",
+  ".mp3": "audio/mpeg",
   ".png": "image/png",
   ".svg": "image/svg+xml",
   ".wasm": "application/wasm",
@@ -29,6 +36,7 @@ const contentTypes = {
 let cameraProcess = null;
 let cameraStartPromise = null;
 let cameraError = "";
+const recordingAnalysisJobs = new Map();
 
 function jsonResponse(response, status, payload) {
   response.writeHead(status, {
@@ -78,6 +86,83 @@ function sessionPath(sessionId, ...parts) {
   }
 
   return target;
+}
+
+function recordingIdFromPathValue(recordingId) {
+  const normalized = String(recordingId ?? "").trim();
+
+  if (!/^[a-z0-9-]+$/i.test(normalized)) {
+    throw new Error("Invalid recording id.");
+  }
+
+  return normalized;
+}
+
+function recordingMetaPath(recordingId) {
+  return resolve(recordingsDir, `${recordingIdFromPathValue(recordingId)}.json`);
+}
+
+function recordingPath(recordingId, ...parts) {
+  const normalized = recordingIdFromPathValue(recordingId);
+  const recordingRoot = resolve(recordingsDir, normalized);
+  const target = resolve(recordingRoot, ...parts);
+
+  if (target !== recordingRoot && !target.startsWith(recordingRoot + sep)) {
+    throw new Error("Path escaped recording directory.");
+  }
+
+  return target;
+}
+
+function normalizeCloudinaryRecording(payload) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Cloudinary recording payload is required.");
+  }
+
+  const publicId = String(payload.public_id ?? "").trim();
+  const videoUrl = String(payload.video_url ?? "").trim();
+
+  if (!publicId) {
+    throw new Error("Cloudinary public_id is required.");
+  }
+
+  if (!videoUrl) {
+    throw new Error("Cloudinary video_url is required.");
+  }
+
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(videoUrl);
+  } catch {
+    throw new Error("Cloudinary video_url must be a valid URL.");
+  }
+
+  if (parsedUrl.protocol !== "https:") {
+    throw new Error("Cloudinary video_url must use HTTPS.");
+  }
+
+  const sessionId = payload.session_id ? String(payload.session_id).trim() : "";
+
+  if (sessionId && !/^[a-z0-9-]+$/i.test(sessionId)) {
+    throw new Error("Invalid session id.");
+  }
+
+  return {
+    public_id: publicId,
+    video_url: videoUrl,
+    session_id: sessionId || null,
+    source: String(payload.source ?? "gestureforge_screen_recording"),
+    resource_type: String(payload.resource_type ?? "video"),
+    format: payload.format ? String(payload.format) : null,
+    type: payload.type ? String(payload.type) : null,
+    bytes: Number(payload.bytes || 0),
+    duration: Number(payload.duration || 0),
+    width: Number(payload.width || 0),
+    height: Number(payload.height || 0),
+    original_filename: payload.original_filename ? basename(String(payload.original_filename)) : null,
+    analysis_status: "queued",
+  };
 }
 
 function ensureSafeGitHubUrl(githubUrl) {
@@ -331,6 +416,504 @@ async function writeSessionMeta(sessionId, meta) {
   await writeFile(sessionPath(sessionId, "session.json"), JSON.stringify(meta, null, 2), "utf-8");
 }
 
+async function writeRecordingMeta(recording) {
+  await mkdir(recordingsDir, { recursive: true });
+  await writeFile(recordingMetaPath(recording.recording_id), JSON.stringify(recording, null, 2), "utf-8");
+
+  if (recording.session_id) {
+    try {
+      await writeFile(sessionPath(recording.session_id, "cloudinary-recording.json"), JSON.stringify(recording, null, 2), "utf-8");
+    } catch {
+    }
+  }
+}
+
+async function readRecordingMeta(recordingId) {
+  return JSON.parse(await readFile(recordingMetaPath(recordingId), "utf-8"));
+}
+
+async function patchRecordingMeta(recordingId, patch) {
+  const current = await readRecordingMeta(recordingId);
+  const next = {
+    ...current,
+    ...patch,
+    updated_at: new Date().toISOString(),
+  };
+  await writeRecordingMeta(next);
+  return next;
+}
+
+async function saveCloudinaryRecording(payload) {
+  const recording = {
+    recording_id: randomUUID(),
+    ...normalizeCloudinaryRecording(payload),
+    received_at: new Date().toISOString(),
+  };
+
+  await mkdir(recordingPath(recording.recording_id), { recursive: true });
+  await writeRecordingMeta(recording);
+  processRecordingAnalysis(recording.recording_id);
+
+  return recording;
+}
+
+async function runRecordingVideoAnalyzer(recording) {
+  const analysisPath = recordingPath(recording.recording_id, "analysis.json");
+  const feedbackPath = recordingPath(recording.recording_id, "feedback.json");
+  const scriptPath = resolve(rootDir, "tools", "analyze_recording_video.py");
+  const args = [
+    scriptPath,
+    "--video-url",
+    recording.video_url,
+    "--public-id",
+    recording.public_id,
+    "--work-dir",
+    recordingPath(recording.recording_id),
+    "--json-out",
+    analysisPath,
+    "--assistant-state",
+    backboardStatePath,
+  ];
+
+  await mkdir(recordingPath(recording.recording_id), { recursive: true });
+
+  try {
+    await stat(feedbackPath);
+    args.push("--feedback-json", feedbackPath);
+  } catch {
+  }
+
+  await runCommand(pythonExecutable, args);
+
+  return JSON.parse(await readFile(analysisPath, "utf-8"));
+}
+
+function processRecordingAnalysis(recordingId) {
+  const normalizedId = recordingIdFromPathValue(recordingId);
+
+  if (recordingAnalysisJobs.has(normalizedId)) {
+    return recordingAnalysisJobs.get(normalizedId);
+  }
+
+  const job = (async () => {
+    try {
+      const recording = await patchRecordingMeta(normalizedId, {
+        analysis_status: "analyzing",
+        analysis_started_at: new Date().toISOString(),
+        analysis_error: undefined,
+      });
+      const analysis = await runRecordingVideoAnalyzer(recording);
+      const analysisStatus = analysis.status === "failed"
+        ? "failed"
+        : analysis.status === "partial" ? "partial" : "complete";
+      const analysisErrors = Array.isArray(analysis.errors) ? analysis.errors.join(" / ") : "";
+      await patchRecordingMeta(normalizedId, {
+        analysis_status: analysisStatus,
+        ...(analysisStatus === "failed" ? { analysis_error: analysisErrors || "Video analysis failed." } : {}),
+        analysis_path: "analysis.json",
+        analysis_finished_at: new Date().toISOString(),
+      });
+      if (analysisStatus !== "failed") {
+        const latestRecording = await readRecordingMeta(normalizedId);
+        await saveClipPlan(latestRecording, analysis);
+      }
+      return analysis;
+    } catch (error) {
+      await patchRecordingMeta(normalizedId, {
+        analysis_status: "failed",
+        analysis_error: error.message,
+        analysis_finished_at: new Date().toISOString(),
+      });
+      throw error;
+    } finally {
+      recordingAnalysisJobs.delete(normalizedId);
+    }
+  })();
+
+  recordingAnalysisJobs.set(normalizedId, job);
+  job.catch(() => {});
+  return job;
+}
+
+async function saveRecordingFeedback(recordingId, payload) {
+  const normalizedId = recordingIdFromPathValue(recordingId);
+  const recording = await readRecordingMeta(normalizedId);
+  const feedback = {
+    prompt: String(payload?.prompt ?? "").trim(),
+    feedback: String(payload?.feedback ?? "").trim(),
+    created_at: new Date().toISOString(),
+  };
+
+  await mkdir(recordingPath(normalizedId), { recursive: true });
+  await writeFile(recordingPath(normalizedId, "feedback.json"), JSON.stringify(feedback, null, 2), "utf-8");
+  await patchRecordingMeta(normalizedId, {
+    analysis_status: "queued",
+    analysis_error: undefined,
+    clip_plan_status: "stale",
+    user_prompt: feedback.prompt,
+    user_feedback: feedback.feedback,
+    feedback_at: feedback.created_at,
+  });
+
+  if (!recordingAnalysisJobs.has(normalizedId)) {
+    processRecordingAnalysis(recording.recording_id);
+  }
+
+  return {
+    recording_id: recording.recording_id,
+    analysis_status: "queued",
+    prompt: feedback.prompt,
+    feedback: feedback.feedback,
+  };
+}
+
+function numberOr(value, fallback = 0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function overlapDuration(aStart, aEnd, bStart, bEnd) {
+  return Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
+}
+
+function cleanOverlayText(value, fallback) {
+  return String(value || fallback || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 90);
+}
+
+async function localClipAssetCatalog() {
+  const entries = await readdir(assetDir, { withFileTypes: true });
+  const files = entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
+  const definitions = [
+    {
+      id: "meme_laugh",
+      kind: "meme",
+      label: "Laugh Meme",
+      filename: "laughing.jpg",
+      tags: ["laugh", "funny", "reaction"],
+    },
+    {
+      id: "meme_embarrassed",
+      kind: "meme",
+      label: "Embarrassed Meme",
+      filename: "embarrassed.gif",
+      tags: ["embarrassed", "awkward", "fail", "reaction"],
+    },
+    {
+      id: "sound_laugh",
+      kind: "sound",
+      label: "Laugh Sound",
+      filename: "lagzjackson-funny-laughing-sound-effect-205565.mp3",
+      tags: ["laugh", "funny", "reaction"],
+    },
+    {
+      id: "sound_wtf",
+      kind: "sound",
+      label: "WTF Sound",
+      filename: "universfield-what-a-fuck-120320.mp3",
+      tags: ["wtf", "surprise", "fail", "reaction"],
+    },
+  ];
+
+  return definitions
+    .filter((asset) => files.includes(asset.filename))
+    .map((asset) => ({
+      ...asset,
+      path: `asset/${asset.filename}`,
+      url: `/api/assets/${encodeURIComponent(asset.filename)}`,
+    }));
+}
+
+function assetById(catalog, assetId) {
+  return catalog.find((asset) => asset.id === assetId) ?? null;
+}
+
+function hintedAsset(catalog, assetId, kind) {
+  const asset = assetById(catalog, String(assetId || ""));
+  return asset?.kind === kind ? asset : null;
+}
+
+function chooseClipAssets(candidate, audioSignals, catalog) {
+  const hintedMeme = hintedAsset(catalog, candidate.asset_hints?.meme ?? candidate.selected_assets?.meme, "meme");
+  const hintedSound = hintedAsset(catalog, candidate.asset_hints?.sound ?? candidate.selected_assets?.sound, "sound");
+  const signalText = [
+    candidate.title,
+    candidate.reason,
+    candidate.source,
+    ...(candidate.signals ?? []),
+    ...audioSignals.map((signal) => signal.label),
+  ].join(" ").toLowerCase();
+  const laughLike = signalText.includes("laugh");
+  const awkwardLike = signalText.includes("embarrass") || signalText.includes("awkward") || signalText.includes("fail");
+  const surpriseLike = signalText.includes("wtf") || signalText.includes("scream") || signalText.includes("shriek") || signalText.includes("surprise");
+
+  return {
+    meme: hintedMeme ?? assetById(catalog, awkwardLike ? "meme_embarrassed" : "meme_laugh"),
+    sound: hintedSound ?? assetById(catalog, laughLike ? "sound_laugh" : surpriseLike ? "sound_wtf" : "sound_laugh"),
+  };
+}
+
+function transcriptSegmentsForClip(analysis, clipStart, clipEnd) {
+  const segments = Array.isArray(analysis?.transcription?.segments) ? analysis.transcription.segments : [];
+
+  return segments
+    .filter((segment) => overlapDuration(numberOr(segment.start), numberOr(segment.end), clipStart, clipEnd) > 0)
+    .slice(0, 6)
+    .map((segment) => ({
+      start: Math.max(0, Number((numberOr(segment.start) - clipStart).toFixed(2))),
+      end: Math.max(0.2, Number((numberOr(segment.end) - clipStart).toFixed(2))),
+      text: cleanOverlayText(segment.text, ""),
+    }))
+    .filter((segment) => segment.text);
+}
+
+function audioSignalsForClip(analysis, clipStart, clipEnd) {
+  const events = Array.isArray(analysis?.audio?.events) ? analysis.audio.events : [];
+
+  return events
+    .filter((event) => overlapDuration(numberOr(event.start), numberOr(event.end), clipStart, clipEnd) > 0)
+    .map((event) => ({
+      label: String(event.label || "audio"),
+      start: Math.max(0, Number((numberOr(event.start) - clipStart).toFixed(2))),
+      end: Math.max(0.2, Number((numberOr(event.end) - clipStart).toFixed(2))),
+      score: numberOr(event.score),
+    }));
+}
+
+function highlightCandidates(analysis) {
+  const highlights = Array.isArray(analysis?.highlights) ? analysis.highlights : [];
+  const funnyMoments = Array.isArray(analysis?.multimodal?.funny_moments) ? analysis.multimodal.funny_moments : [];
+  const audioEvents = Array.isArray(analysis?.audio?.events) ? analysis.audio.events : [];
+  const merged = [...highlights, ...funnyMoments]
+    .filter((item) => item && typeof item === "object")
+    .map((item) => ({
+      start: numberOr(item.start),
+      end: numberOr(item.end, numberOr(item.start) + 4),
+      score: Math.min(1, Math.max(0, numberOr(item.score, 0.5))),
+      title: cleanOverlayText(item.title, "Funny moment"),
+      reason: cleanOverlayText(item.reason, "Backboard flagged this as a highlight."),
+      source: String(item.source || "backboard"),
+      signals: Array.isArray(item.signals) ? item.signals.map(String) : [],
+      asset_hints: item.asset_hints && typeof item.asset_hints === "object"
+        ? {
+            meme: String(item.asset_hints.meme || ""),
+            sound: String(item.asset_hints.sound || ""),
+          }
+        : {},
+    }))
+    .filter((item) => item.end > item.start);
+
+  if (merged.length) {
+    return merged;
+  }
+
+  return audioEvents
+    .filter((item) => item && typeof item === "object")
+    .map((item) => ({
+      start: numberOr(item.start),
+      end: numberOr(item.end, numberOr(item.start) + 3),
+      score: Math.min(0.75, Math.max(0.35, numberOr(item.score, 0.45))),
+      title: cleanOverlayText(String(item.label || "audio").replaceAll("_", " "), "Audio moment"),
+      reason: cleanOverlayText(item.reason, "Audio event detected."),
+      source: "audio",
+      signals: [String(item.label || "audio")],
+    }))
+    .filter((item) => item.end > item.start);
+}
+
+function buildClipPlan(recording, analysis, assetCatalog) {
+  const candidates = highlightCandidates(analysis)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+    .sort((a, b) => a.start - b.start);
+  const sourceDuration = numberOr(analysis?.audio?.summary?.duration, numberOr(recording.duration, 0));
+  const selected = candidates.length
+    ? candidates
+    : [{ start: 0, end: Math.min(sourceDuration || 8, 8), score: 0.35, title: "Opening moment", reason: "Fallback clip because no highlight was detected.", source: "fallback", signals: [] }];
+  const clips = selected.map((candidate, index) => {
+    const paddedStart = Math.max(0, candidate.start - 0.45);
+    const rawEnd = Math.max(candidate.end + 0.65, paddedStart + 2.5);
+    const paddedEnd = sourceDuration ? Math.min(sourceDuration, rawEnd) : rawEnd;
+    const duration = Math.max(1.2, paddedEnd - paddedStart);
+    const audioSignals = audioSignalsForClip(analysis, paddedStart, paddedEnd);
+    const strongAudio = audioSignals.some((event) => ["scream_or_shriek", "laughter_like_bursts"].includes(event.label));
+    const selectedAssets = chooseClipAssets(candidate, audioSignals, assetCatalog);
+
+    return {
+      id: `clip_${String(index + 1).padStart(2, "0")}`,
+      order: index + 1,
+      source_public_id: recording.public_id,
+      trim: {
+        start: Number(paddedStart.toFixed(2)),
+        end: Number(paddedEnd.toFixed(2)),
+        duration: Number(duration.toFixed(2)),
+      },
+      crop: {
+        aspect_ratio: "9:16",
+        width: 1080,
+        height: 1920,
+        mode: "fill",
+        gravity: "auto",
+      },
+      captions: transcriptSegmentsForClip(analysis, paddedStart, paddedEnd),
+      overlays: [
+        selectedAssets.meme
+          ? {
+              type: "asset",
+              role: "meme_reaction",
+              asset_id: selectedAssets.meme.id,
+              asset_path: selectedAssets.meme.path,
+              label: selectedAssets.meme.label,
+              position: "upper_right",
+              start: Number(Math.min(0.2, duration / 5).toFixed(2)),
+              duration: Number(Math.min(2.2, duration).toFixed(2)),
+            }
+          : null,
+        {
+          type: "text",
+          role: "meme_title",
+          text: cleanOverlayText(candidate.title, "Funny moment").toUpperCase(),
+          position: "top",
+          start: 0,
+          duration: Math.min(2.8, duration),
+        },
+        {
+          type: "text",
+          role: "context",
+          text: cleanOverlayText(candidate.reason, ""),
+          position: "bottom",
+          start: Math.max(0, duration - 2.8),
+          duration: Math.min(2.8, duration),
+        },
+      ].filter((overlay) => overlay && (overlay.type === "asset" || overlay.text)),
+      sound_effects: selectedAssets.sound
+        ? [
+            {
+              asset_id: selectedAssets.sound.id,
+              asset_path: selectedAssets.sound.path,
+              label: selectedAssets.sound.label,
+              start: Number(Math.min(Math.max(0.25, duration * 0.22), Math.max(0, duration - 0.7)).toFixed(2)),
+              volume: strongAudio ? 0.55 : 0.42,
+              mix: "duck_original_audio",
+            },
+          ]
+        : [],
+      selected_assets: {
+        meme: selectedAssets.meme?.id ?? null,
+        sound: selectedAssets.sound?.id ?? null,
+      },
+      effects: {
+        zoom: {
+          enabled: candidate.score >= 0.7,
+          style: "subtle_punch_in",
+          start: Number(Math.min(0.35, duration / 4).toFixed(2)),
+          duration: Number(Math.min(1.4, duration / 2).toFixed(2)),
+        },
+        freeze_frame: {
+          enabled: strongAudio,
+          at: Number(Math.max(0.4, Math.min(duration - 0.4, duration * 0.58)).toFixed(2)),
+          duration: strongAudio ? 0.45 : 0,
+          reason: strongAudio ? "Emphasize scream/laughter reaction." : "",
+        },
+      },
+      audio_signals: audioSignals,
+      source_highlight: candidate,
+    };
+  });
+
+  return {
+    version: 1,
+    status: "planned",
+    generated_at: new Date().toISOString(),
+    generator: "gestureforge-backboard-clip-plan-v1",
+    recording_id: recording.recording_id,
+    source: {
+      public_id: recording.public_id,
+      video_url: recording.video_url,
+      duration: sourceDuration || null,
+    },
+    output: {
+      format: "mp4",
+      width: 1080,
+      height: 1920,
+      aspect_ratio: "9:16",
+      video_codec: "h264",
+      audio_codec: "aac",
+      quality: "auto",
+    },
+    sequence: {
+      mode: "splice",
+      transition: "cut",
+      clips,
+    },
+    asset_policy: {
+      source: "local_asset_directory_only",
+      asset_root: "asset",
+      allowed_asset_ids: assetCatalog.map((asset) => asset.id),
+      note: "Clip plan may only reference assets listed in asset_catalog.",
+    },
+    asset_catalog: assetCatalog,
+    subtitle_style: {
+      font_family: "Arial",
+      font_size: 64,
+      color: "white",
+      background: "rgba(0,0,0,0.58)",
+      gravity: "south",
+    },
+    meme_style: {
+      font_family: "Impact",
+      font_size: 78,
+      color: "white",
+      stroke: "black",
+      gravity: "north",
+    },
+    manual_tuning: {
+      editable_fields: [
+        "sequence.clips[].trim.start",
+        "sequence.clips[].trim.end",
+        "sequence.clips[].overlays[].text",
+        "sequence.clips[].selected_assets.meme",
+        "sequence.clips[].selected_assets.sound",
+        "sequence.clips[].effects.zoom.enabled",
+        "sequence.clips[].effects.freeze_frame.enabled",
+      ],
+    },
+  };
+}
+
+async function saveClipPlan(recording, analysis) {
+  const assetCatalog = await localClipAssetCatalog();
+  const plan = buildClipPlan(recording, analysis, assetCatalog);
+
+  await mkdir(recordingPath(recording.recording_id), { recursive: true });
+  await writeFile(recordingPath(recording.recording_id, "clip-plan.json"), JSON.stringify(plan, null, 2), "utf-8");
+  await patchRecordingMeta(recording.recording_id, {
+    clip_plan_status: "planned",
+    clip_plan_path: "clip-plan.json",
+    clip_plan_generated_at: plan.generated_at,
+  });
+  return plan;
+}
+
+async function getOrCreateClipPlan(recordingId) {
+  const recording = await readRecordingMeta(recordingId);
+  const existing = await readOptionalJson(recordingPath(recording.recording_id, "clip-plan.json"));
+
+  if (existing) {
+    return existing;
+  }
+
+  const analysis = await readOptionalJson(recordingPath(recording.recording_id, "analysis.json"));
+
+  if (!analysis) {
+    throw new Error("Video analysis must finish before generating a clip plan.");
+  }
+
+  return saveClipPlan(recording, analysis);
+}
+
 async function runKeyboardAnalyzer(sessionId) {
   const sourceDir = sessionPath(sessionId, "original");
   const analysisPath = sessionPath(sessionId, "analysis.json");
@@ -564,9 +1147,37 @@ async function serveSessionFile(response, sessionId, urlPath) {
   }
 }
 
+async function serveAssetFile(response, filename) {
+  const safeName = basename(decodeURIComponent(filename));
+  const filePath = resolve(assetDir, safeName);
+
+  if (filePath !== resolve(assetDir, safeName) || !filePath.startsWith(assetDir + sep)) {
+    textResponse(response, 404, "Not found");
+    return;
+  }
+
+  try {
+    const info = await stat(filePath);
+
+    if (!info.isFile()) {
+      textResponse(response, 404, "Not found");
+      return;
+    }
+
+    response.writeHead(200, {
+      "Content-Type": contentTypes[extname(filePath).toLowerCase()] ?? "application/octet-stream",
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*",
+    });
+    createReadStream(filePath).pipe(response);
+  } catch {
+    textResponse(response, 404, "Not found");
+  }
+}
+
 async function readOptionalJson(path) {
   try {
-    return JSON.parse(await readFile(path, "utf-8"));
+    return JSON.parse((await readFile(path, "utf-8")).replace(/^\uFEFF/, ""));
   } catch {
     return null;
   }
@@ -983,6 +1594,12 @@ async function handleRequest(request, response) {
       return;
     }
 
+    const assetMatch = url.pathname.match(/^\/api\/assets\/([^/]+)$/i);
+    if (request.method === "GET" && assetMatch) {
+      await serveAssetFile(response, assetMatch[1]);
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/api/camera/health") {
       jsonResponse(response, 200, {
         status: (await cameraHealth()) ? "ready" : "stopped",
@@ -1018,6 +1635,105 @@ async function handleRequest(request, response) {
 
     if (request.method === "GET" && url.pathname === "/api/camera/state") {
       await proxyCameraState(response);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/recordings/cloudinary") {
+      const recording = await saveCloudinaryRecording(await readJsonBody(request));
+      jsonResponse(response, 201, {
+        status: "cloudinary_recording_saved",
+        analysis_status: recording.analysis_status,
+        recording_id: recording.recording_id,
+        public_id: recording.public_id,
+        video_url: recording.video_url,
+      });
+      return;
+    }
+
+    const recordingMatch = url.pathname.match(/^\/api\/recordings\/([a-z0-9-]+)$/i);
+    if (request.method === "GET" && recordingMatch) {
+      jsonResponse(response, 200, await readRecordingMeta(recordingMatch[1]));
+      return;
+    }
+
+    const recordingAnalyzeMatch = url.pathname.match(/^\/api\/recordings\/([a-z0-9-]+)\/analyze$/i);
+    if (request.method === "POST" && recordingAnalyzeMatch) {
+      const recording = await readRecordingMeta(recordingAnalyzeMatch[1]);
+
+      if (!["queued", "failed"].includes(recording.analysis_status)) {
+        jsonResponse(response, 202, {
+          recording_id: recording.recording_id,
+          analysis_status: recording.analysis_status,
+        });
+        return;
+      }
+
+      processRecordingAnalysis(recording.recording_id);
+      jsonResponse(response, 202, {
+        recording_id: recording.recording_id,
+        analysis_status: "queued",
+      });
+      return;
+    }
+
+    const recordingFeedbackMatch = url.pathname.match(/^\/api\/recordings\/([a-z0-9-]+)\/feedback$/i);
+    if (request.method === "POST" && recordingFeedbackMatch) {
+      jsonResponse(response, 202, await saveRecordingFeedback(recordingFeedbackMatch[1], await readJsonBody(request)));
+      return;
+    }
+
+    const recordingAnalysisMatch = url.pathname.match(/^\/api\/recordings\/([a-z0-9-]+)\/analysis$/i);
+    if (request.method === "GET" && recordingAnalysisMatch) {
+      const recording = await readRecordingMeta(recordingAnalysisMatch[1]);
+      const analysis = await readOptionalJson(recordingPath(recording.recording_id, "analysis.json"));
+
+      if (!analysis || !["complete", "partial", "failed"].includes(recording.analysis_status)) {
+        jsonResponse(response, recording.analysis_status === "failed" ? 500 : 202, {
+          recording_id: recording.recording_id,
+          analysis_status: recording.analysis_status,
+          error: recording.analysis_error,
+        });
+        return;
+      }
+
+      jsonResponse(response, 200, {
+        recording_id: recording.recording_id,
+        analysis_status: recording.analysis_status,
+        analysis,
+      });
+      return;
+    }
+
+    const clipPlanMatch = url.pathname.match(/^\/api\/recordings\/([a-z0-9-]+)\/clip-plan$/i);
+    if (request.method === "GET" && clipPlanMatch) {
+      const plan = await getOrCreateClipPlan(clipPlanMatch[1]);
+      jsonResponse(response, 200, {
+        recording_id: clipPlanMatch[1],
+        clip_plan_status: plan.status,
+        plan,
+      });
+      return;
+    }
+
+    const regenerateClipPlanMatch = url.pathname.match(/^\/api\/recordings\/([a-z0-9-]+)\/clip-plan\/regenerate$/i);
+    if (request.method === "POST" && regenerateClipPlanMatch) {
+      const recording = await readRecordingMeta(regenerateClipPlanMatch[1]);
+      const analysis = await readOptionalJson(recordingPath(recording.recording_id, "analysis.json"));
+
+      if (!analysis) {
+        jsonResponse(response, 409, {
+          recording_id: recording.recording_id,
+          error: "Video analysis must finish before regenerating a clip plan.",
+        });
+        return;
+      }
+
+      const plan = await saveClipPlan(recording, analysis);
+      jsonResponse(response, 200, {
+        recording_id: recording.recording_id,
+        clip_plan_status: plan.status,
+        plan,
+      });
       return;
     }
 
@@ -1168,6 +1884,7 @@ async function handleRequest(request, response) {
 }
 
 await mkdir(sessionsDir, { recursive: true });
+await mkdir(recordingsDir, { recursive: true });
 
 createServer(handleRequest).listen(defaultPort, () => {
   console.log(`GestureForge backend listening on http://localhost:${defaultPort}`);

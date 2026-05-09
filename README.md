@@ -156,6 +156,90 @@ control is shaped for the next GestureForge step: show it to the user, let the
 user select controls, then replace selected keyboard checks with GestureForge
 control functions.
 
+## Cloudinary Recording + AI Video Analysis
+
+Recordings are uploaded directly from the browser to Cloudinary as original
+video files. The backend receives the returned `video_url` and `public_id`, then
+starts an async AI analysis job:
+
+```text
+Cloudinary original video
+  -> backend stores video_url/public_id
+  -> Whisper transcript
+  -> local audio event detection for high volume, scream-like, and laughter-like bursts
+  -> sampled frames + transcript + audio events sent to Backboard
+  -> Backboard memory applies saved user highlight preferences
+  -> funny highlight windows saved to tmp/recordings/<recording_id>/analysis.json
+```
+
+Required local configuration:
+
+```powershell
+Copy-Item .env.example .env
+# Fill OPENAI_API_KEY, VITE_CLOUDINARY_CLOUD_NAME, and VITE_CLOUDINARY_UPLOAD_PRESET.
+# Fill BACKBOARD_API_KEY for multimodal funny moment judgment and preference memory.
+venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+`ffmpeg` must be available on `PATH`, or set `FFMPEG` in `.env`.
+
+Relevant model defaults:
+
+```env
+OPENAI_TRANSCRIBE_MODEL=whisper-1
+BACKBOARD_API_KEY=your_backboard_api_key
+BACKBOARD_LLM_PROVIDER=openai
+BACKBOARD_MODEL_NAME=gpt-4o
+BACKBOARD_MEMORY_MODE=Readonly
+BACKBOARD_ANALYSIS_MEMORY_MODE=Readonly
+```
+
+Level 04 includes a feedback area where users can write a preferred analysis
+prompt and feedback on the current highlights. Submitting it calls
+`POST /api/recordings/<recording_id>/feedback`, stores the preference through
+Backboard memory, and re-runs the multimodal highlight selection.
+
+Recording metadata endpoint:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://localhost:8787/api/recordings/cloudinary `
+  -ContentType application/json `
+  -Body '{"public_id":"gestureforge/demo","video_url":"https://res.cloudinary.com/.../video/upload/demo.webm"}'
+```
+
+Poll analysis:
+
+```powershell
+Invoke-RestMethod http://localhost:8787/api/recordings/<recording_id>
+Invoke-RestMethod http://localhost:8787/api/recordings/<recording_id>/analysis
+```
+
+Generate the Cloudinary edit plan after analysis:
+
+```powershell
+Invoke-RestMethod http://localhost:8787/api/recordings/<recording_id>/clip-plan
+Invoke-RestMethod -Method Post http://localhost:8787/api/recordings/<recording_id>/clip-plan/regenerate
+```
+
+The generated plan contains trim windows, 9:16 crop settings, splice order,
+caption segments, meme/title overlays, local meme/sound asset choices, and
+zoom/freeze-frame suggestions. It does not render the final mp4 yet; that is
+the next Cloudinary transformation step.
+
+The asset policy is intentionally locked down: clip plans may only reference
+the local `asset` catalog. Current allowed IDs are `meme_laugh`,
+`meme_embarrassed`, `sound_laugh`, and `sound_wtf`.
+
+Apply user feedback and re-run analysis:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://localhost:8787/api/recordings/<recording_id>/feedback `
+  -ContentType application/json `
+  -Body '{"prompt":"Prefer short absurd fail clips.","feedback":"Score loud reactions higher next time."}'
+```
+
 ```json
 {
   "controls": [
