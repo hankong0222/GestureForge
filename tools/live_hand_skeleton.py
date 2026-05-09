@@ -18,6 +18,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from hand_finger_states import finger_states
+
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "runs" / "hand_skeleton"
@@ -115,6 +117,34 @@ def draw_handedness(
     draw_label(frame, f"{label} {score:.2f}", (x, y), (146, 255, 115))
 
 
+def handedness_label(handedness: object | None) -> str | None:
+    if handedness is None:
+        return None
+
+    return handedness.classification[0].label
+
+
+def draw_finger_states(
+    frame: np.ndarray,
+    points: list[tuple[int, int]],
+    states: dict[str, bool],
+) -> None:
+    x = min(point[0] for point in points)
+    y = min(frame.shape[0] - 112, max(48, max(point[1] for point in points) + 22))
+    short_names = {
+        "thumb": "T",
+        "index": "I",
+        "middle": "M",
+        "ring": "R",
+        "pinky": "P",
+    }
+
+    for row, finger in enumerate(("thumb", "index", "middle", "ring", "pinky")):
+        color = FINGER_COLORS[finger] if states[finger] else (112, 122, 142)
+        status = "EXT" if states[finger] else "FOLD"
+        draw_label(frame, f"{short_names[finger]} {status}", (x, y + row * 20), color)
+
+
 def main() -> None:
     args = parse_args()
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
@@ -158,9 +188,11 @@ def main() -> None:
             handedness = results.multi_handedness or []
 
             for index, hand_landmarks in enumerate(landmarks):
+                current_handedness = handedness[index] if index < len(handedness) else None
                 points = landmark_points(hand_landmarks, width, height)
                 draw_hand(frame, points)
-                draw_handedness(frame, points, handedness[index] if index < len(handedness) else None)
+                draw_handedness(frame, points, current_handedness)
+                draw_finger_states(frame, points, finger_states(hand_landmarks, handedness_label(current_handedness)))
                 hands_count += 1
 
             now = time.perf_counter()

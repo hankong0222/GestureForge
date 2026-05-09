@@ -126,6 +126,10 @@ input {
   align-items: center;
 }
 
+.gesture-editor-grid {
+  grid-template-columns: 1fr;
+}
+
 .step-tabs {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -163,6 +167,10 @@ input {
 
 .wide-panel {
   max-width: 700px;
+}
+
+.gesture-stage {
+  max-width: 100%;
 }
 
 .eyebrow {
@@ -209,6 +217,486 @@ h1 {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
+  margin-top: 18px;
+}
+
+.gesture-lab {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.58fr) minmax(440px, 1fr) minmax(220px, 0.58fr);
+  gap: 18px;
+  align-items: stretch;
+}
+
+.control-board,
+.hand-rig {
+  border: 4px solid var(--ink);
+  background: #0b1020;
+  box-shadow: 8px 8px 0 var(--shadow);
+}
+
+.control-board {
+  padding: 16px;
+}
+
+.pose-buttons {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.pose-buttons button {
+  min-height: 36px;
+  border: 2px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.pose-buttons button:hover {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.finger-controls {
+  display: grid;
+  gap: 12px;
+}
+
+.finger-control {
+  display: grid;
+  grid-template-columns: 66px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.fold-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.fold-toggle button {
+  min-height: 34px;
+  border: 2px solid var(--line);
+  background: #111827;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.fold-toggle button.is-active {
+  border-color: var(--green);
+  background: var(--panel);
+  color: var(--green);
+  box-shadow: 3px 3px 0 #000;
+}
+
+.hand-rig {
+  min-height: 430px;
+  display: grid;
+  grid-template-rows: 1fr auto;
+  overflow: hidden;
+}
+
+.rig-stage {
+  min-height: 374px;
+  position: relative;
+  overflow: hidden;
+  perspective: 620px;
+  background:
+    linear-gradient(rgba(93, 230, 255, 0.08) 2px, transparent 2px),
+    linear-gradient(90deg, rgba(93, 230, 255, 0.08) 2px, transparent 2px),
+    #0d1830;
+  background-size: 28px 28px;
+}
+
+.rig-gridline {
+  position: absolute;
+  inset: 18px;
+  border: 2px dashed rgba(246, 241, 223, 0.2);
+}
+
+.rig-readout {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-top: 3px solid var(--ink);
+  color: var(--yellow);
+  font-size: 13px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.rig-hand {
+  --thumb-base-fold: 0deg;
+  --thumb-mid-fold: 0deg;
+  --thumb-tip-fold: 0deg;
+  --index-base-fold: 0deg;
+  --index-mid-fold: 0deg;
+  --index-tip-fold: 0deg;
+  --middle-base-fold: 0deg;
+  --middle-mid-fold: 0deg;
+  --middle-tip-fold: 0deg;
+  --ring-base-fold: 0deg;
+  --ring-mid-fold: 0deg;
+  --ring-tip-fold: 0deg;
+  --pinky-base-fold: 0deg;
+  --pinky-mid-fold: 0deg;
+  --pinky-tip-fold: 0deg;
+  width: 118px;
+  height: 198px;
+  position: absolute;
+  bottom: 24px;
+  transform-origin: 50% 100%;
+}
+
+.rig-hand.left {
+  left: 7%;
+  transform: rotate(-5deg);
+}
+
+.rig-hand.right {
+  right: 7%;
+  transform: scaleX(-1) rotate(-5deg);
+}
+
+.rig-finger,
+.rig-palm,
+.rig-wrist {
+  position: absolute;
+  border: 3px solid #090c17;
+  background: #ffe6b8;
+  image-rendering: pixelated;
+  box-shadow: inset -5px -5px 0 #e2b982;
+}
+
+.rig-finger {
+  width: 21px;
+  height: 1px;
+  bottom: 88px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  transform-origin: 50% 100%;
+  transform-style: preserve-3d;
+  z-index: 3;
+}
+
+.rig-thumb {
+  left: 8px;
+  bottom: 68px;
+  transform: rotate(-44deg);
+}
+
+.rig-index {
+  left: 33px;
+}
+
+.rig-middle {
+  left: 53px;
+  bottom: 92px;
+}
+
+.rig-ring {
+  left: 73px;
+}
+
+.rig-pinky {
+  left: 92px;
+  bottom: 84px;
+}
+
+.finger-segment {
+  width: 21px;
+  display: block;
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  border: 3px solid #090c17;
+  background: #ffe6b8;
+  box-shadow: inset -4px -4px 0 #e2b982;
+  transform-origin: 50% 100%;
+  backface-visibility: visible;
+  transform-style: preserve-3d;
+  transition: transform 170ms steps(4, end), filter 170ms steps(4, end);
+}
+
+.rig-palm::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 6px;
+  height: 22px;
+  border: 3px solid #090c17;
+  background: #ffdca7;
+  box-shadow: inset -4px -4px 0 #d79f6f;
+}
+
+.finger-segment.base {
+  height: 33px;
+}
+
+.finger-segment.mid {
+  height: 27px;
+  bottom: 25px;
+}
+
+.finger-segment.tip {
+  height: 21px;
+  bottom: 20px;
+  background: #ffefcf;
+}
+
+.rig-middle .finger-segment.base {
+  height: 38px;
+}
+
+.rig-middle .finger-segment.mid {
+  height: 30px;
+  bottom: 30px;
+}
+
+.rig-middle .finger-segment.tip {
+  height: 23px;
+  bottom: 23px;
+}
+
+.rig-pinky .finger-segment.base {
+  height: 27px;
+}
+
+.rig-pinky .finger-segment.mid {
+  height: 21px;
+  bottom: 19px;
+}
+
+.rig-pinky .finger-segment.tip {
+  height: 18px;
+  bottom: 16px;
+}
+
+.rig-thumb .finger-segment.base {
+  height: 27px;
+  background: #ffefcf;
+}
+
+.rig-thumb .finger-segment.mid {
+  display: none;
+}
+
+.rig-thumb .finger-segment.tip {
+  height: 22px;
+  bottom: 21px;
+}
+
+.rig-thumb .finger-segment.base {
+  transform: rotateX(var(--thumb-base-fold));
+}
+
+.rig-thumb .finger-segment.tip {
+  transform: rotateX(var(--thumb-tip-fold));
+}
+
+.rig-index .finger-segment.base {
+  transform: rotateX(var(--index-base-fold));
+}
+
+.rig-index .finger-segment.mid {
+  transform: rotateX(var(--index-mid-fold));
+}
+
+.rig-index .finger-segment.tip {
+  transform: rotateX(var(--index-tip-fold));
+}
+
+.rig-middle .finger-segment.base {
+  transform: rotateX(var(--middle-base-fold));
+}
+
+.rig-middle .finger-segment.mid {
+  transform: rotateX(var(--middle-mid-fold));
+}
+
+.rig-middle .finger-segment.tip {
+  transform: rotateX(var(--middle-tip-fold));
+}
+
+.rig-ring .finger-segment.base {
+  transform: rotateX(var(--ring-base-fold));
+}
+
+.rig-ring .finger-segment.mid {
+  transform: rotateX(var(--ring-mid-fold));
+}
+
+.rig-ring .finger-segment.tip {
+  transform: rotateX(var(--ring-tip-fold));
+}
+
+.rig-pinky .finger-segment.base {
+  transform: rotateX(var(--pinky-base-fold));
+}
+
+.rig-pinky .finger-segment.mid {
+  transform: rotateX(var(--pinky-mid-fold));
+}
+
+.rig-pinky .finger-segment.tip {
+  transform: rotateX(var(--pinky-tip-fold));
+}
+
+.rig-finger.is-folded {
+  bottom: 82px;
+  z-index: 8;
+}
+
+.rig-finger.is-folded .finger-segment {
+  height: 24px;
+  width: 27px;
+  border-width: 3px;
+  background: #ffe6b8;
+  box-shadow: inset -4px -4px 0 #d79f6f, 0 3px 0 rgba(0, 0, 0, 0.42);
+}
+
+.rig-finger.is-folded .finger-segment.base {
+  bottom: 0;
+  transform: translate(-2px, 26px) rotate(3deg);
+}
+
+.rig-finger.is-folded .finger-segment.mid {
+  display: none;
+}
+
+.rig-finger.is-folded .finger-segment.tip {
+  display: none;
+}
+
+.rig-finger.is-folded .finger-segment.base::before,
+.rig-finger.is-folded .finger-segment.base::after {
+  content: "";
+  position: absolute;
+  border: 3px solid #090c17;
+  background: #ffe6b8;
+  box-shadow: inset -4px -4px 0 #d79f6f;
+}
+
+.rig-finger.is-folded .finger-segment.base::before {
+  width: 26px;
+  height: 21px;
+  left: -3px;
+  top: -19px;
+}
+
+.rig-finger.is-folded .finger-segment.base::after {
+  width: 24px;
+  height: 18px;
+  left: 0;
+  top: -34px;
+  background: #ffefcf;
+}
+
+.rig-thumb.is-folded {
+  left: 16px;
+  bottom: 61px;
+  transform: rotate(-24deg);
+  z-index: 10;
+}
+
+.rig-thumb.is-folded .finger-segment.base {
+  width: 28px;
+  height: 22px;
+  transform: translate(23px, 16px) rotate(48deg);
+}
+
+.rig-thumb.is-folded .finger-segment.tip {
+  display: block;
+  width: 26px;
+  height: 20px;
+  bottom: 18px;
+  transform: translate(2px, 0) rotate(-4deg);
+}
+
+.rig-thumb.is-folded .finger-segment.base::before,
+.rig-thumb.is-folded .finger-segment.base::after {
+  display: none;
+}
+
+.rig-index.is-folded {
+  left: 30px;
+  transform: rotate(-4deg);
+}
+
+.rig-middle.is-folded {
+  left: 50px;
+  bottom: 84px;
+  transform: rotate(1deg);
+}
+
+.rig-ring.is-folded {
+  left: 70px;
+  transform: rotate(4deg);
+}
+
+.rig-pinky.is-folded {
+  left: 89px;
+  bottom: 79px;
+  transform: rotate(7deg);
+}
+
+.rig-hand.is-fist .rig-palm {
+  width: 76px;
+  height: 48px;
+  left: 24px;
+  bottom: 28px;
+  z-index: 4;
+  background: #ffe6b8;
+  box-shadow: inset -5px -5px 0 #e2b982;
+}
+
+.rig-hand.is-fist .rig-palm::before {
+  display: none;
+}
+
+.rig-hand.is-fist .rig-wrist {
+  width: 36px;
+  height: 28px;
+  left: 44px;
+  bottom: 2px;
+}
+
+.rig-palm {
+  width: 74px;
+  height: 68px;
+  left: 25px;
+  bottom: 28px;
+  z-index: 2;
+  border-radius: 0 0 18px 18px;
+  background:
+    linear-gradient(#ffd89a 0 0) 12px 12px / 13px 13px no-repeat,
+    #ffe6b8;
+}
+
+.rig-wrist {
+  width: 34px;
+  height: 30px;
+  left: 45px;
+  bottom: 0;
+  background: #f0c58e;
 }
 
 .preset-card {
@@ -746,8 +1234,21 @@ kbd {
   }
 
   .preset-grid,
-  .display-grid {
+  .display-grid,
+  .gesture-lab {
     grid-template-columns: 1fr;
+  }
+
+  .hand-rig {
+    order: -1;
+  }
+
+  .rig-hand.left {
+    left: 12%;
+  }
+
+  .rig-hand.right {
+    right: 12%;
   }
 }
 

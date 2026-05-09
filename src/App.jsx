@@ -40,6 +40,38 @@ const gesturePresets = [
   },
 ];
 
+const fingerControls = [
+  { id: "thumb", label: "Thumb" },
+  { id: "index", label: "Index" },
+  { id: "middle", label: "Middle" },
+  { id: "ring", label: "Ring" },
+  { id: "pinky", label: "Pinky" },
+];
+
+const handPosePresets = {
+  open: {
+    thumb: 100,
+    index: 100,
+    middle: 100,
+    ring: 100,
+    pinky: 100,
+  },
+  fist: {
+    thumb: 0,
+    index: 0,
+    middle: 0,
+    ring: 0,
+    pinky: 0,
+  },
+  peace: {
+    thumb: 30,
+    index: 100,
+    middle: 100,
+    ring: 0,
+    pinky: 0,
+  },
+};
+
 function formatFileSize(bytes) {
   if (!bytes) {
     return "0 KB";
@@ -115,6 +147,93 @@ function GestureRings() {
       <span />
       <span />
       <span />
+    </div>
+  );
+}
+
+function FingerSlider({ id, label, value, onChange }) {
+  const isExtended = value === 100;
+
+  return (
+    <div className="finger-control">
+      <span>{label}</span>
+      <div className="fold-toggle" role="group" aria-label={`${label} state`}>
+        <button
+          className={!isExtended ? "is-active" : ""}
+          type="button"
+          onClick={() => onChange(id, 0)}
+        >
+          Fold
+        </button>
+        <button
+          className={isExtended ? "is-active" : ""}
+          type="button"
+          onClick={() => onChange(id, 100)}
+        >
+          Extend
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RigHand({ side, pose }) {
+  const isFist = Object.values(pose).every((value) => value === 0);
+  const foldVars = Object.fromEntries(
+    Object.entries(pose).flatMap(([finger, value]) => {
+      const fold = 100 - value;
+      return [
+        [`--${finger}-base-fold`, `${fold * -0.46}deg`],
+        [`--${finger}-mid-fold`, `${fold * -0.64}deg`],
+        [`--${finger}-tip-fold`, `${fold * -0.56}deg`],
+      ];
+    }),
+  );
+
+  const style = {
+    ...foldVars,
+  };
+
+  return (
+    <div className={`rig-hand ${side}${isFist ? " is-fist" : ""}`} style={style} aria-hidden="true">
+      {fingerControls.map((finger) => (
+        <span
+          className={`rig-finger rig-${finger.id} ${
+            pose[finger.id] === 100 ? "is-extended" : "is-folded"
+          }`}
+          key={finger.id}
+        >
+          {finger.id === "thumb" ? (
+            <span className="finger-segment base">
+              <span className="finger-segment tip" />
+            </span>
+          ) : (
+            <span className="finger-segment base">
+              <span className="finger-segment mid">
+                <span className="finger-segment tip" />
+              </span>
+            </span>
+          )}
+        </span>
+      ))}
+      <span className="rig-palm" />
+      <span className="rig-wrist" />
+    </div>
+  );
+}
+
+function HandRig({ pose }) {
+  return (
+    <div className="hand-rig" aria-label="Gesture hand preview">
+      <div className="rig-stage">
+        <div className="rig-gridline" />
+        <RigHand side="left" pose={pose.left} />
+        <RigHand side="right" pose={pose.right} />
+      </div>
+      <div className="rig-readout">
+        <span>Dual Hand Preview</span>
+        <span className="mini-led">TRACKING</span>
+      </div>
     </div>
   );
 }
@@ -200,13 +319,76 @@ function UploadPanel({
 }
 
 function ChooseGesturePanel({ selectedPresetId, onPresetChange, onBack, onNext }) {
+  const [handPose, setHandPose] = useState({
+    left: handPosePresets.fist,
+    right: handPosePresets.fist,
+  });
+
+  function updateFinger(hand, id, value) {
+    setHandPose((currentPose) => ({
+      ...currentPose,
+      [hand]: {
+        ...currentPose[hand],
+        [id]: value,
+      },
+    }));
+  }
+
+  function applyPose(hand, poseName) {
+    setHandPose((currentPose) => ({
+      ...currentPose,
+      [hand]: handPosePresets[poseName],
+    }));
+  }
+
+  function renderControlBoard(hand, label) {
+    return (
+      <div className="control-board" aria-label={`${label} finger control board`}>
+        <div className="board-title">
+          <span>{label}</span>
+          <span className="mini-led">CONTROL</span>
+        </div>
+
+        <div className="pose-buttons" aria-label={`${label} quick hand poses`}>
+          <button type="button" onClick={() => applyPose(hand, "open")}>
+            Open
+          </button>
+          <button type="button" onClick={() => applyPose(hand, "fist")}>
+            Fist
+          </button>
+          <button type="button" onClick={() => applyPose(hand, "peace")}>
+            Peace
+          </button>
+        </div>
+
+        <div className="finger-controls">
+          {fingerControls.map((finger) => (
+            <FingerSlider
+              id={finger.id}
+              key={finger.id}
+              label={finger.label}
+              value={handPose[hand][finger.id]}
+              onChange={(id, value) => updateFinger(hand, id, value)}
+            />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <section className="stage-panel wide-panel">
+    <section className="stage-panel gesture-stage">
       <p className="eyebrow">Level 02</p>
       <h1 id="page-title">CHOOSE THE GESTURE</h1>
       <p className="intro">
         Pick the gesture language that will replace the game's keyboard controls.
       </p>
+
+      <div className="gesture-lab">
+        {renderControlBoard("left", "Left Hand")}
+        <HandRig pose={handPose} />
+        {renderControlBoard("right", "Right Hand")}
+      </div>
 
       <div className="preset-grid" role="radiogroup" aria-label="Gesture presets">
         {gesturePresets.map((preset) => (
@@ -412,9 +594,9 @@ export default function App() {
 
         <StepTabs currentStep={currentStep} onStepChange={setCurrentStep} />
 
-        <div className="hero-grid">
+        <div className={`hero-grid${currentStep === 2 ? " gesture-editor-grid" : ""}`}>
           {renderStep()}
-          <GesturePreview selectedPreset={selectedPreset} />
+          {currentStep !== 2 && <GesturePreview selectedPreset={selectedPreset} />}
         </div>
       </section>
     </main>
