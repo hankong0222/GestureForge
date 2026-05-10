@@ -139,18 +139,39 @@ function mergeSourceLists(...lists) {
   return merged;
 }
 
+function controlActionKey(control) {
+  const suggested = String(control?.suggested_function ?? "").trim().toLowerCase();
+  const action = String(control?.action ?? control?.id ?? "").trim().toLowerCase();
+
+  return suggested || action;
+}
+
+function controlPrimaryScore(control) {
+  const action = String(control?.action ?? "").trim().toLowerCase();
+  const key = String(control?.key ?? "").trim().toLowerCase();
+  const code = String(control?.code ?? "").trim().toLowerCase();
+  let score = Number(control?.confidence ?? 0);
+
+  if (key === action || code === action) {
+    score += 10;
+  }
+
+  if (Array.isArray(control?.usage_targets) && control.usage_targets.length) {
+    score += 1;
+  }
+
+  return score;
+}
+
 function dedupeAnalysisControls(nextAnalysis) {
   const controls = Array.isArray(nextAnalysis?.controls) ? nextAnalysis.controls : [];
   const mergedControls = [];
   const byKey = new Map();
 
   controls.forEach((control) => {
-    const action = String(control.action ?? control.id ?? "").trim().toLowerCase();
-    const key = String(control.key ?? "").trim().toLowerCase();
-    const code = String(control.code ?? "").trim().toLowerCase();
-    const dedupeKey = `${action}|${key}|${code}`;
+    const dedupeKey = controlActionKey(control);
 
-    if (!action && !key && !code) {
+    if (!dedupeKey) {
       mergedControls.push(control);
       return;
     }
@@ -168,12 +189,26 @@ function dedupeAnalysisControls(nextAnalysis) {
       return;
     }
 
-    existing.usage_targets = mergeSourceLists(existing.usage_targets ?? [], control.usage_targets ?? []);
-    existing.evidence = mergeSourceLists(existing.evidence ?? [], control.evidence ?? []);
-    existing.confidence = Math.max(Number(existing.confidence ?? 0), Number(control.confidence ?? 0));
+    const preferred = controlPrimaryScore(control) > controlPrimaryScore(existing) ? { ...control } : existing;
+    const secondary = preferred === existing ? control : existing;
 
-    if (!existing.binding_target && control.binding_target) {
-      existing.binding_target = control.binding_target;
+    if (preferred !== existing) {
+      const index = mergedControls.indexOf(existing);
+      byKey.set(dedupeKey, preferred);
+      mergedControls[index] = preferred;
+    }
+
+    preferred.usage_targets = mergeSourceLists(preferred.usage_targets ?? [], secondary.usage_targets ?? []);
+    preferred.evidence = mergeSourceLists(preferred.evidence ?? [], secondary.evidence ?? []);
+    preferred.alternate_bindings = mergeSourceLists(
+      preferred.alternate_bindings ?? [],
+      secondary.binding_target ? [secondary.binding_target] : [],
+      secondary.alternate_bindings ?? [],
+    );
+    preferred.confidence = Math.max(Number(preferred.confidence ?? 0), Number(secondary.confidence ?? 0));
+
+    if (!preferred.binding_target && secondary.binding_target) {
+      preferred.binding_target = secondary.binding_target;
     }
   });
 
