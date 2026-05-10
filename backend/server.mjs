@@ -108,6 +108,8 @@ const contentTypes = {
 let cameraProcess = null;
 let cameraStartPromise = null;
 let cameraError = "";
+let cameraLastFailureAt = 0;
+const cameraStartCooldownMs = Math.max(1500, Number(process.env.CAMERA_START_COOLDOWN_MS ?? 4000) || 4000);
 const recordingAnalysisJobs = new Map();
 
 function jsonResponse(response, status, payload) {
@@ -443,7 +445,14 @@ async function ensureCameraStream() {
   cameraStartPromise = (async () => {
     if (await cameraHealth()) {
       cameraError = "";
+      cameraLastFailureAt = 0;
       return;
+    }
+
+    const recentFailureAge = cameraLastFailureAt ? Date.now() - cameraLastFailureAt : Infinity;
+
+    if (recentFailureAge < cameraStartCooldownMs) {
+      throw new Error(cameraError || `Camera start is cooling down for ${Math.ceil((cameraStartCooldownMs - recentFailureAge) / 1000)}s.`);
     }
 
     cameraError = "";
@@ -452,17 +461,24 @@ async function ensureCameraStream() {
       for (let index = 0; index < 30; index += 1) {
         if (await cameraHealth()) {
           cameraError = "";
+          cameraLastFailureAt = 0;
           return;
         }
         await wait(200);
       }
 
+      cameraLastFailureAt = Date.now();
       throw new Error(cameraError || "Camera process is running but did not become ready.");
     }
 
     const scriptPath = resolve(rootDir, "tools", "hand_camera_stream.py");
     const cameraIndex = String(process.env.CAMERA_INDEX ?? "-1");
+    const cameraBackend = String(process.env.CAMERA_BACKEND ?? "").trim();
     const args = [scriptPath, "--port", String(cameraPort), "--camera", cameraIndex, "--mirror"];
+
+    if (cameraBackend) {
+      args.push("--backend", cameraBackend);
+    }
 
     cameraProcess = spawn(pythonExecutable, args, {
       cwd: rootDir,
@@ -480,11 +496,15 @@ async function ensureCameraStream() {
     });
     cameraProcess.on("error", (error) => {
       cameraError = error.message;
+      cameraLastFailureAt = Date.now();
       cameraProcess = null;
     });
     cameraProcess.on("close", (code) => {
       if (code !== 0 && code !== null && !cameraError) {
         cameraError = `camera process exited with ${code}`;
+      }
+      if (cameraError) {
+        cameraLastFailureAt = Date.now();
       }
       cameraProcess = null;
       cameraStartPromise = null;
@@ -492,11 +512,14 @@ async function ensureCameraStream() {
 
     for (let index = 0; index < 30; index += 1) {
       if (await cameraHealth()) {
+        cameraError = "";
+        cameraLastFailureAt = 0;
         return;
       }
       await wait(200);
     }
 
+    cameraLastFailureAt = Date.now();
     throw new Error(cameraError || "Camera stream did not become ready.");
   })();
 
@@ -532,18 +555,19 @@ async function stopCameraStream() {
     }
   }
 
-  try {
-    cameraProcess.kill();
-  } catch {
-  }
-
-  cameraProcess = null;
-  cameraError = "";
-  return true;
+  cameraError = "Camera service did not respond to graceful shutdown.";
+  return false;
 }
 
 async function proxyCameraVideo(response) {
-  await ensureCameraStream();
+  if (!(await cameraHealth())) {
+    jsonResponse(response, 503, {
+      error: cameraError || "Camera is not running. Start the camera first.",
+      port: cameraPort,
+      status: "stopped",
+    });
+    return;
+  }
 
   const proxyRequest = httpRequest(
     {
@@ -574,7 +598,20 @@ async function proxyCameraVideo(response) {
 }
 
 async function proxyCameraState(response) {
-  await ensureCameraStream();
+  if (!(await cameraHealth())) {
+    jsonResponse(response, 200, {
+      status: "stopped",
+      trackerStatus: "stopped",
+      hands: 0,
+      fingers: {},
+      indexExtended: false,
+      indexFolded: false,
+      updatedAt: 0,
+      error: cameraError || undefined,
+      port: cameraPort,
+    });
+    return;
+  }
 
   const stateRequest = httpRequest(
     {
@@ -4099,36 +4136,56 @@ async function displayPage(response, sessionId) {
         return false;
       }
     }
+    let cameraRetryTimer = null;
+    let gesturePolling = false;
+    function scheduleCameraStart(delay) {
+      if (cameraRetryTimer) {
+        clearTimeout(cameraRetryTimer);
+      }
+      cameraRetryTimer = setTimeout(startCamera, delay);
+    }
     async function pollGestureState() {
       try {
         const response = await fetch("/api/camera/state", { cache: "no-store" });
         const state = await response.json();
         const pushed = pushGestureState(state);
-        const pose = state.hands ? (state.indexExtended ? "INDEX EXT" : "INDEX FOLD") : "NO HAND";
-        cameraStatus.textContent = pushed ? "Camera on / " + pose : "Camera on / runtime pending / " + pose;
+        const isStopped = state.status === "stopped";
+        const pose = isStopped ? "STOPPED" : state.hands ? (state.indexExtended ? "INDEX EXT" : "INDEX FOLD") : "NO HAND";
+        cameraStatus.textContent = pushed && !isStopped ? "Camera on / " + pose : "Camera / " + pose;
       } catch (error) {
         cameraStatus.textContent = error.message;
       } finally {
-        window.setTimeout(pollGestureState, 80);
+        if (gesturePolling) {
+          window.setTimeout(pollGestureState, 80);
+        }
       }
+    }
+    function startGesturePolling() {
+      if (gesturePolling) return;
+      gesturePolling = true;
+      pollGestureState();
     }
     async function startCamera() {
       try {
+        if (cameraRetryTimer) {
+          clearTimeout(cameraRetryTimer);
+          cameraRetryTimer = null;
+        }
         cameraStatus.textContent = "Starting camera";
         const response = await fetch("/api/camera/start");
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "Camera failed");
         camera.src = "/api/camera/video?t=" + Date.now();
         cameraStatus.textContent = "Camera on / index state";
-        pollGestureState();
+        startGesturePolling();
       } catch (error) {
         cameraStatus.textContent = error.message;
-        setTimeout(startCamera, 2500);
+        scheduleCameraStart(4000);
       }
     }
     camera.onerror = () => {
       cameraStatus.textContent = "Camera retry";
-      setTimeout(startCamera, 1200);
+      scheduleCameraStart(1800);
     };
     startCamera();
   </script>

@@ -37,6 +37,8 @@ class LazyHandTracker:
         self.handedness_label = None
         self.landmark_points = None
         self.lock = threading.Lock()
+        self.loader = threading.Thread(target=self._load, daemon=True)
+        self.loader.start()
 
     def status(self) -> str:
         with self.lock:
@@ -132,6 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="HTTP host.")
     parser.add_argument("--port", type=int, default=8791, help="HTTP port.")
     parser.add_argument("--camera", type=int, default=-1, help="Webcam index. Use -1 to auto-detect.")
+    parser.add_argument("--backend", choices=("dshow", "msmf", "any", "auto"), default="auto", help="OpenCV camera backend.")
     parser.add_argument("--width", type=int, default=640, help="Requested camera width.")
     parser.add_argument("--height", type=int, default=480, help="Requested camera height.")
     parser.add_argument("--mirror", action="store_true", help="Mirror the webcam image.")
@@ -164,11 +167,17 @@ class HandCamera:
 
     def open_capture(self):
         indices = [self.args.camera] if self.args.camera >= 0 else list(range(6))
-        backends = [
-            ("DSHOW", cv2.CAP_DSHOW),
-            ("MSMF", cv2.CAP_MSMF),
-            ("ANY", cv2.CAP_ANY),
-        ]
+        backend_map = {
+            "dshow": [("DSHOW", cv2.CAP_DSHOW)],
+            "msmf": [("MSMF", cv2.CAP_MSMF)],
+            "any": [("ANY", cv2.CAP_ANY)],
+            "auto": [
+                ("DSHOW", cv2.CAP_DSHOW),
+                ("MSMF", cv2.CAP_MSMF),
+                ("ANY", cv2.CAP_ANY),
+            ],
+        }
+        backends = backend_map[self.args.backend]
         errors: list[str] = []
 
         for index in indices:
@@ -178,7 +187,15 @@ class HandCamera:
                 capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.args.height)
 
                 if capture.isOpened():
-                    ok, _ = capture.read()
+                    ok = False
+
+                    for _ in range(12):
+                        ok, _ = capture.read()
+
+                        if ok:
+                            break
+
+                        time.sleep(0.08)
 
                     if ok:
                         print(f"Using camera index {index} via {backend_name}", flush=True)
@@ -205,8 +222,6 @@ class HandCamera:
             return self.latest_frame
 
     def capture_loop(self) -> None:
-        self.tracker._load()
-
         while not self.stop_event.is_set():
             ok, frame = self.capture.read()
 

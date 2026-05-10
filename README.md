@@ -8,7 +8,7 @@ Your current `venv` points to a missing Python install. If it fails to run, inst
 Remove-Item -Recurse -Force venv
 python -m venv venv
 venv\Scripts\python.exe -m pip install --upgrade pip
-venv\Scripts\python.exe -m pip install -r requirements.txt
+venv\Scripts\python.exe -m pip install -r requirements-local.txt
 ```
 
 Open the webcam and draw MediaPipe hand skeleton lines:
@@ -193,7 +193,7 @@ Copy-Item .env.example .env
 # Fill OPENAI_API_KEY, VITE_CLOUDINARY_CLOUD_NAME, and VITE_CLOUDINARY_UPLOAD_PRESET.
 # Fill BACKBOARD_API_KEY for multimodal funny moment judgment and preference memory.
 # Fill CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET for server-side MP4 rendering.
-venv\Scripts\python.exe -m pip install -r requirements.txt
+venv\Scripts\python.exe -m pip install -r requirements-local.txt
 ```
 
 `ffmpeg` must be available on `PATH`, or set `FFMPEG` in `.env`.

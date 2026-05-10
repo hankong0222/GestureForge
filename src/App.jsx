@@ -6,7 +6,9 @@ const handCameraStreamUrl = `${apiBaseUrl}/api/camera/video`;
 const companyGumImageAsset = "Caffeinated Chewing Gum.png";
 const fakeGeneratedImageUrl = `${apiBaseUrl}/api/assets/${encodeURIComponent(companyGumImageAsset)}`;
 const companyAdVideoAsset = "Caffeinated Chewing Gum.mp4";
+const savedAuthKey = "gestureforge.authProfile.v1";
 const savedStateKey = "gestureforge.uiState.v1";
+const savedCompanyStateKey = "gestureforge.companyState.v1";
 const recordingMimeTypes = [
   "video/webm;codecs=vp9",
   "video/webm;codecs=vp8",
@@ -52,6 +54,48 @@ const emptyAnalysis = {
   controls: [],
   unresolved: [],
 };
+
+function readStoredJson(key, fallback = null) {
+  try {
+    const raw = window.localStorage.getItem(key);
+
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function readSessionJson(key, fallback = null) {
+  try {
+    const raw = window.sessionStorage.getItem(key);
+
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function storedObject(key) {
+  const value = readStoredJson(key, {});
+
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function storedStep(value) {
+  const step = Number(value);
+
+  return Number.isInteger(step) && step >= 1 && step <= 4 ? step : 1;
+}
+
+function isPageReload() {
+  try {
+    const navigation = window.performance?.getEntriesByType?.("navigation")?.[0];
+
+    return navigation?.type === "reload";
+  } catch {
+    return false;
+  }
+}
 
 const companyPalettes = [
   {
@@ -1191,13 +1235,27 @@ function CameraPreview() {
   const [streamReady, setStreamReady] = useState(false);
   const [streamUrl, setStreamUrl] = useState("");
   const [cameraStatus, setCameraStatus] = useState("STARTING CAMERA");
+  const retryTimerRef = useRef(null);
+  const restartRef = useRef(() => {});
 
   useEffect(() => {
     let isMounted = true;
-    let retryTimer;
+
+    function clearRetryTimer() {
+      if (retryTimerRef.current) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+    }
+
+    function scheduleStart(delay = 2500) {
+      clearRetryTimer();
+      retryTimerRef.current = window.setTimeout(startCamera, delay);
+    }
 
     async function startCamera() {
       try {
+        clearRetryTimer();
         setCameraStatus("STARTING CAMERA");
         const response = await fetch(`${apiBaseUrl}/api/camera/start`);
         const payload = await response.json();
@@ -1214,19 +1272,25 @@ function CameraPreview() {
         if (isMounted) {
           setStreamReady(false);
           setCameraStatus(error.message);
-          retryTimer = window.setTimeout(startCamera, 2500);
+          scheduleStart(4000);
         }
       }
     }
 
+    restartRef.current = () => {
+      if (!isMounted) {
+        return;
+      }
+
+      setStreamReady(false);
+      setCameraStatus("CAMERA RETRY");
+      scheduleStart(1800);
+    };
     startCamera();
 
     return () => {
       isMounted = false;
-
-      if (retryTimer) {
-        window.clearTimeout(retryTimer);
-      }
+      clearRetryTimer();
 
       fetch(`${apiBaseUrl}/api/camera/stop`, { method: "POST", keepalive: true }).catch(() => {});
     };
@@ -1240,9 +1304,7 @@ function CameraPreview() {
           src={streamUrl}
           onLoad={() => setStreamReady(true)}
           onError={() => {
-            setStreamReady(false);
-            setCameraStatus("CAMERA RETRY");
-            setStreamUrl(`${handCameraStreamUrl}?t=${Date.now()}`);
+            restartRef.current();
           }}
         />
       )}
@@ -1293,7 +1355,6 @@ function DisplayPanel({
       }
     }
 
-    fetch(`${apiBaseUrl}/api/camera/start`).catch(() => {});
     pollGestureState();
 
     return () => {
@@ -1302,8 +1363,6 @@ function DisplayPanel({
       if (timer) {
         window.clearTimeout(timer);
       }
-
-      fetch(`${apiBaseUrl}/api/camera/stop`, { method: "POST", keepalive: true }).catch(() => {});
     };
   }, []);
 
@@ -2159,16 +2218,37 @@ function BackboardPreview({ plan }) {
 
 function EntrepreneurWorkspace({ authProfile, onLogout }) {
   const fakeGenerationTimersRef = useRef([]);
-  const [companyName, setCompanyName] = useState("");
-  const [productIdea, setProductIdea] = useState("");
-  const [ragContext, setRagContext] = useState("");
-  const [companyPage, setCompanyPage] = useState("upload");
-  const [plan, setPlan] = useState(null);
+  const companyStateOwner = authProfile?.email || authProfile?.id || authProfile?.role || "unknown";
+  const [initialCompanyState] = useState(() => {
+    const saved = storedObject(savedCompanyStateKey);
+
+    return saved.owner === companyStateOwner ? saved : {};
+  });
+  const [companyName, setCompanyName] = useState(() => initialCompanyState.companyName ?? "");
+  const [productIdea, setProductIdea] = useState(() => initialCompanyState.productIdea ?? "");
+  const [ragContext, setRagContext] = useState(() => initialCompanyState.ragContext ?? "");
+  const [companyPage, setCompanyPage] = useState(() => initialCompanyState.companyPage ?? "upload");
+  const [plan, setPlan] = useState(() => initialCompanyState.plan ?? null);
   const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
   const [generationError, setGenerationError] = useState("");
   const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
   const [videoError, setVideoError] = useState("");
-  const [hasOpenedVideoLayer, setHasOpenedVideoLayer] = useState(false);
+  const [hasOpenedVideoLayer, setHasOpenedVideoLayer] = useState(() => Boolean(initialCompanyState.hasOpenedVideoLayer));
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      savedCompanyStateKey,
+      JSON.stringify({
+        owner: companyStateOwner,
+        companyName,
+        productIdea,
+        ragContext,
+        companyPage,
+        plan,
+        hasOpenedVideoLayer,
+      }),
+    );
+  }, [companyStateOwner, companyName, productIdea, ragContext, companyPage, plan, hasOpenedVideoLayer]);
   const canGenerate = companyName.trim() && productIdea.trim();
 
   useEffect(() => () => {
@@ -2567,8 +2647,9 @@ function EntrepreneurWorkspace({ authProfile, onLogout }) {
 }
 
 export default function App() {
+  const [initialUiState] = useState(() => storedObject(savedStateKey));
   const fileInputRef = useRef(null);
-  const [authProfile, setAuthProfile] = useState(null);
+  const [authProfile, setAuthProfile] = useState(() => (isPageReload() ? readSessionJson(savedAuthKey, null) : null));
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
   const recordingStreamRef = useRef(null);
@@ -2577,24 +2658,27 @@ export default function App() {
   const recordingCancelledRef = useRef(false);
   const sessionRef = useRef(null);
   const [selectedFile, setSelectedFile] = useState(null);
-  const [githubUrl, setGithubUrl] = useState("");
+  const [githubUrl, setGithubUrl] = useState(() => initialUiState.githubUrl ?? "");
   const [isDragging, setIsDragging] = useState(false);
-  const [currentStep, setCurrentStep] = useState(1);
-  const [analysis, setAnalysis] = useState(emptyAnalysis);
-  const [session, setSession] = useState(null);
-  const [sessionStatus, setSessionStatus] = useState("");
-  const [mappings, setMappings] = useState({});
-  const [draftMappings, setDraftMappings] = useState({});
-  const [selectedControlId, setSelectedControlId] = useState("");
+  const [currentStep, setCurrentStep] = useState(() => storedStep(initialUiState.currentStep));
+  const [analysis, setAnalysis] = useState(() => initialUiState.analysis ?? emptyAnalysis);
+  const [session, setSession] = useState(() => initialUiState.session ?? null);
+  const [sessionStatus, setSessionStatus] = useState(() => initialUiState.sessionStatus ?? "");
+  const [mappings, setMappings] = useState(() => initialUiState.mappings ?? {});
+  const [draftMappings, setDraftMappings] = useState(() => initialUiState.draftMappings ?? {});
+  const [selectedControlId, setSelectedControlId] = useState(() => initialUiState.selectedControlId ?? "");
   const [conflictPulse, setConflictPulse] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
-  const [patchReport, setPatchReport] = useState(null);
+  const [patchReport, setPatchReport] = useState(() => initialUiState.patchReport ?? null);
   const [isPlanningPatch, setIsPlanningPatch] = useState(false);
   const [isApplyingPatch, setIsApplyingPatch] = useState(false);
   const [patchApplyError, setPatchApplyError] = useState("");
 
   function authenticate(profile) {
     setAuthProfile(profile);
+    window.sessionStorage.setItem(savedAuthKey, JSON.stringify(profile));
+    window.localStorage.removeItem(savedAuthKey);
+    window.localStorage.removeItem(savedCompanyStateKey);
     window.localStorage.removeItem(savedStateKey);
     setCurrentStep(1);
     setSession(null);
@@ -2604,38 +2688,42 @@ export default function App() {
 
   function logout() {
     setAuthProfile(null);
+    window.sessionStorage.removeItem(savedAuthKey);
+    window.localStorage.removeItem(savedAuthKey);
+    window.localStorage.removeItem(savedCompanyStateKey);
     window.localStorage.removeItem(savedStateKey);
     handleReset();
   }
   const [recordingStatus, setRecordingStatus] = useState("idle");
   const [recordingError, setRecordingError] = useState("");
   const [recordedClip, setRecordedClip] = useState(null);
-  const [cloudinaryStatus, setCloudinaryStatus] = useState("idle");
-  const [cloudinaryError, setCloudinaryError] = useState("");
-  const [cloudinaryAsset, setCloudinaryAsset] = useState(null);
-  const [videoAnalysisStatus, setVideoAnalysisStatus] = useState("idle");
-  const [videoAnalysisError, setVideoAnalysisError] = useState("");
-  const [videoAnalysis, setVideoAnalysis] = useState(null);
-  const [clipPlanStatus, setClipPlanStatus] = useState("idle");
-  const [clipPlanError, setClipPlanError] = useState("");
-  const [clipPlan, setClipPlan] = useState(null);
-  const [clipPlanDraft, setClipPlanDraft] = useState(null);
-  const [clipRenderStatus, setClipRenderStatus] = useState("idle");
-  const [clipRenderError, setClipRenderError] = useState("");
-  const [clipRender, setClipRender] = useState(null);
-  const [analysisPrompt, setAnalysisPrompt] = useState("");
-  const [analysisFeedback, setAnalysisFeedback] = useState("");
+  const [cloudinaryStatus, setCloudinaryStatus] = useState(() => initialUiState.cloudinaryStatus ?? "idle");
+  const [cloudinaryError, setCloudinaryError] = useState(() => initialUiState.cloudinaryError ?? "");
+  const [cloudinaryAsset, setCloudinaryAsset] = useState(() => initialUiState.cloudinaryAsset ?? null);
+  const [videoAnalysisStatus, setVideoAnalysisStatus] = useState(() => initialUiState.videoAnalysisStatus ?? "idle");
+  const [videoAnalysisError, setVideoAnalysisError] = useState(() => initialUiState.videoAnalysisError ?? "");
+  const [videoAnalysis, setVideoAnalysis] = useState(() => initialUiState.videoAnalysis ?? null);
+  const [clipPlanStatus, setClipPlanStatus] = useState(() => initialUiState.clipPlanStatus ?? "idle");
+  const [clipPlanError, setClipPlanError] = useState(() => initialUiState.clipPlanError ?? "");
+  const [clipPlan, setClipPlan] = useState(() => initialUiState.clipPlan ?? null);
+  const [clipPlanDraft, setClipPlanDraft] = useState(() => initialUiState.clipPlanDraft ?? null);
+  const [clipRenderStatus, setClipRenderStatus] = useState(() => initialUiState.clipRenderStatus ?? "idle");
+  const [clipRenderError, setClipRenderError] = useState(() => initialUiState.clipRenderError ?? "");
+  const [clipRender, setClipRender] = useState(() => initialUiState.clipRender ?? null);
+  const [analysisPrompt, setAnalysisPrompt] = useState(() => initialUiState.analysisPrompt ?? "");
+  const [analysisFeedback, setAnalysisFeedback] = useState(() => initialUiState.analysisFeedback ?? "");
   const [isSavingAnalysisFeedback, setIsSavingAnalysisFeedback] = useState(false);
 
   useEffect(() => {
-    const safeStep = currentStep === 4
-      ? patchReport?.status === "patched" ? 3 : 2
-      : currentStep === 3 && patchReport?.status !== "patched" ? 2 : currentStep;
+    if (!authProfile || authProfile.role !== "player") {
+      return;
+    }
+
     window.localStorage.setItem(
       savedStateKey,
       JSON.stringify({
         githubUrl,
-        currentStep: safeStep,
+        currentStep,
         analysis,
         session,
         sessionStatus,
@@ -2643,9 +2731,50 @@ export default function App() {
         draftMappings,
         selectedControlId,
         patchReport,
+        cloudinaryStatus,
+        cloudinaryError,
+        cloudinaryAsset,
+        videoAnalysisStatus,
+        videoAnalysisError,
+        videoAnalysis,
+        clipPlanStatus,
+        clipPlanError,
+        clipPlan,
+        clipPlanDraft,
+        clipRenderStatus,
+        clipRenderError,
+        clipRender,
+        analysisPrompt,
+        analysisFeedback,
       }),
     );
-  }, [githubUrl, currentStep, analysis, session, sessionStatus, mappings, draftMappings, selectedControlId, patchReport]);
+  }, [
+    authProfile,
+    githubUrl,
+    currentStep,
+    analysis,
+    session,
+    sessionStatus,
+    mappings,
+    draftMappings,
+    selectedControlId,
+    patchReport,
+    cloudinaryStatus,
+    cloudinaryError,
+    cloudinaryAsset,
+    videoAnalysisStatus,
+    videoAnalysisError,
+    videoAnalysis,
+    clipPlanStatus,
+    clipPlanError,
+    clipPlan,
+    clipPlanDraft,
+    clipRenderStatus,
+    clipRenderError,
+    clipRender,
+    analysisPrompt,
+    analysisFeedback,
+  ]);
 
   useEffect(() => () => {
     recordingCancelledRef.current = true;
