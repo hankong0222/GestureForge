@@ -13,7 +13,7 @@ $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 
 Set-Location $ProjectRoot
 
-& $Python tools\analyze_game_controls_with_composio.py `
+& $Python tools\analyze_game_controls_local.py `
   --source $Source `
   --max-files $MaxFiles `
   --max-evidence $MaxEvidence `

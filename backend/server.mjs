@@ -1,8 +1,8 @@
 import { createServer, request as httpRequest } from "node:http";
-import { spawn } from "node:child_process";
-import { createReadStream, readFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join, normalize, resolve, sep } from "node:path";
+import { basename, delimiter, extname, join, normalize, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { loginUser, signupUser } from "./auth.mjs";
@@ -43,11 +43,11 @@ loadDotenvFile(resolve(rootDir, ".env"));
 const assetDir = resolve(rootDir, "asset");
 const sessionsDir = resolve(rootDir, "tmp", "sessions");
 const recordingsDir = resolve(rootDir, "tmp", "recordings");
+const companyAdsDir = resolve(rootDir, "tmp", "ads");
 const backboardStatePath = resolve(rootDir, "tmp", "backboard-state.json");
 const defaultPort = Number(process.env.PORT ?? 8787);
-const pythonExecutable = process.env.PYTHON ?? "python";
+const venvSitePackages = resolve(rootDir, "venv", "Lib", "site-packages");
 const cameraPort = Number(process.env.CAMERA_PORT ?? 8791);
-const analyzerModel = process.env.ANALYZER_MODEL ?? "gpt-4o-mini";
 const analyzerMaxFiles = process.env.ANALYZER_MAX_FILES ?? "50";
 const analyzerMaxEvidence = process.env.ANALYZER_MAX_EVIDENCE ?? "25";
 const analyzerMaxContextLines = process.env.ANALYZER_MAX_CONTEXT_LINES ?? "1";
@@ -58,6 +58,34 @@ const cloudinaryRenderFolder = String(process.env.CLOUDINARY_RENDER_FOLDER ?? "g
   .replace(/^\/+|\/+$/g, "");
 const cloudinaryAssetFolder = String(process.env.CLOUDINARY_ASSET_FOLDER ?? `${cloudinaryRenderFolder}/assets`)
   .replace(/^\/+|\/+$/g, "");
+const cloudinaryRecordingFolder = String(process.env.CLOUDINARY_RECORDING_FOLDER ?? process.env.VITE_CLOUDINARY_FOLDER ?? "gestureforge-recordings")
+  .replace(/^\/+|\/+$/g, "");
+const maxRecordingUploadBytes = Math.max(
+  10 * 1024 * 1024,
+  Number(process.env.MAX_RECORDING_UPLOAD_BYTES ?? 250 * 1024 * 1024) || 250 * 1024 * 1024,
+);
+const companyAdVideoAsset = basename(process.env.COMPANY_AD_VIDEO_ASSET ?? "Caffeinated Chewing Gum.mp4");
+const companyAdMinVoiceSeconds = 7;
+const companyAdMaxVoiceSeconds = 10;
+const elevenLabsApiKey = (process.env.ELEVENLABS_API_KEY ?? "").trim();
+const elevenLabsVoiceId = (process.env.ELEVENLABS_VOICE_ID ?? "JBFqnCBsd6RMkjVDRZzb").trim();
+const elevenLabsModelId = (process.env.ELEVENLABS_MODEL_ID ?? "eleven_multilingual_v2").trim();
+const elevenLabsOutputFormat = (process.env.ELEVENLABS_OUTPUT_FORMAT ?? "mp3_44100_128").trim();
+const backboardApiKey = (process.env.BACKBOARD_API_KEY ?? "").trim();
+const backboardApiBase = (process.env.BACKBOARD_API_BASE ?? "https://app.backboard.io/api").replace(/\/+$/g, "");
+const configuredBackboardAssistantId = (process.env.BACKBOARD_ASSISTANT_ID ?? "").trim();
+const backboardAssistantName = (process.env.BACKBOARD_ASSISTANT_NAME ?? "GestureForge Company Ads").trim();
+const backboardAssistantTokK = Math.min(100, Math.max(1, Number(process.env.BACKBOARD_TOK_K ?? 10) || 10));
+const backboardLlmProvider = (process.env.BACKBOARD_LLM_PROVIDER ?? "").trim();
+const backboardModelName = (process.env.BACKBOARD_MODEL_NAME ?? "").trim();
+const backboardMemoryMode = process.env.BACKBOARD_MEMORY_MODE ?? "Readonly";
+const backboardAdMemoryMode = process.env.BACKBOARD_AD_MEMORY_MODE ?? "Auto";
+const backboardAdMemoryProMode = (process.env.BACKBOARD_AD_MEMORY_PRO_MODE ?? "").trim();
+const pingramApiKey = (process.env.PINGRAM_API_KEY ?? "").trim();
+const pingramSenderName = process.env.PINGRAM_SENDER_NAME ?? "GestureForge";
+const pingramSenderEmail = process.env.PINGRAM_SENDER_EMAIL ?? "hello@gestureforge.local";
+const pingramVideoReadyType = process.env.PINGRAM_VIDEO_READY_TYPE ?? "video_ready_email";
+const pingramRegion = process.env.PINGRAM_REGION ?? "us";
 
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
@@ -67,10 +95,14 @@ const contentTypes = {
   ".jpeg": "image/jpeg",
   ".gif": "image/gif",
   ".json": "application/json; charset=utf-8",
+  ".m4a": "audio/mp4",
+  ".mov": "video/quicktime",
   ".mp3": "audio/mpeg",
+  ".mp4": "video/mp4",
   ".png": "image/png",
   ".svg": "image/svg+xml",
   ".wasm": "application/wasm",
+  ".webm": "video/webm",
 };
 
 let cameraProcess = null;
@@ -83,7 +115,7 @@ function jsonResponse(response, status, payload) {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,X-Filename",
+    "Access-Control-Allow-Headers": "Content-Type,X-Filename,X-Recording-Filename,X-Recording-Duration-Ms,X-Recording-Size,X-Session-Id",
   });
   response.end(JSON.stringify(payload, null, 2));
 }
@@ -152,6 +184,20 @@ function recordingPath(recordingId, ...parts) {
   }
 
   return target;
+}
+
+function companyAdIdFromPathValue(adId) {
+  const normalized = String(adId ?? "").trim();
+
+  if (!/^[a-z0-9_-]+$/i.test(normalized)) {
+    throw new Error("Invalid company ad id.");
+  }
+
+  return normalized;
+}
+
+function companyAdMetaPath(adId) {
+  return resolve(companyAdsDir, `${companyAdIdFromPathValue(adId)}.json`);
 }
 
 function normalizeCloudinaryRecording(payload) {
@@ -227,11 +273,90 @@ function ensureSafeGitHubUrl(githubUrl) {
   return `https://github.com/${parts[0]}/${parts[1].replace(/\.git$/, "")}.git`;
 }
 
+function executableWorks(command, args = ["--version"]) {
+  try {
+    const result = spawnSync(command, args, {
+      cwd: rootDir,
+      env: process.env,
+      shell: false,
+      windowsHide: true,
+      timeout: 5000,
+    });
+
+    return !result.error && result.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function resolvePythonExecutable() {
+  const configured = process.env.PYTHON;
+  const codexPython = process.env.USERPROFILE
+    ? resolve(process.env.USERPROFILE, ".cache", "codex-runtimes", "codex-primary-runtime", "dependencies", "python", "python.exe")
+    : "";
+  const candidates = [
+    configured,
+    resolve(rootDir, "venv", "Scripts", "python.exe"),
+    codexPython,
+    "py",
+    "python",
+    "python.exe",
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if ((candidate === "py" || candidate === "python" || candidate === "python.exe" || existsSync(candidate)) && executableWorks(candidate)) {
+      return candidate;
+    }
+  }
+
+  return configured || "python";
+}
+
+const pythonExecutable = resolvePythonExecutable();
+
+function pythonProcessEnv(extraEnv = {}) {
+  const pythonPaths = [];
+
+  if (existsSync(venvSitePackages)) {
+    pythonPaths.push(venvSitePackages);
+  }
+
+  if (process.env.PYTHONPATH) {
+    pythonPaths.push(process.env.PYTHONPATH);
+  }
+
+  return {
+    ...process.env,
+    PYTHONPATH: pythonPaths.join(delimiter),
+    ...(extraEnv ?? {}),
+  };
+}
+
+function resolveGitExecutable() {
+  const configured = process.env.GIT_EXECUTABLE || process.env.GIT_PATH;
+  const candidates = [
+    configured,
+    "git",
+    "git.exe",
+    "C:\\Program Files\\Git\\cmd\\git.exe",
+    "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
+    "D:\\Git\\cmd\\git.exe",
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (candidate === "git" || candidate === "git.exe" || existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return "git";
+}
+
 function runCommand(command, args, options = {}) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd ?? rootDir,
-      env: { ...process.env, ...(options.env ?? {}) },
+      env: options.env ?? process.env,
       shell: false,
       windowsHide: true,
     });
@@ -311,22 +436,37 @@ function requestCameraShutdown() {
 }
 
 async function ensureCameraStream() {
-  if (await cameraHealth()) {
-    return;
-  }
-
   if (cameraStartPromise) {
     return cameraStartPromise;
   }
 
   cameraStartPromise = (async () => {
+    if (await cameraHealth()) {
+      cameraError = "";
+      return;
+    }
+
     cameraError = "";
+
+    if (cameraProcess) {
+      for (let index = 0; index < 30; index += 1) {
+        if (await cameraHealth()) {
+          cameraError = "";
+          return;
+        }
+        await wait(200);
+      }
+
+      throw new Error(cameraError || "Camera process is running but did not become ready.");
+    }
+
     const scriptPath = resolve(rootDir, "tools", "hand_camera_stream.py");
-    const args = [scriptPath, "--port", String(cameraPort), "--mirror"];
+    const cameraIndex = String(process.env.CAMERA_INDEX ?? "-1");
+    const args = [scriptPath, "--port", String(cameraPort), "--camera", cameraIndex, "--mirror"];
 
     cameraProcess = spawn(pythonExecutable, args, {
       cwd: rootDir,
-      env: { ...process.env },
+      env: pythonProcessEnv(),
       shell: false,
       windowsHide: true,
     });
@@ -369,7 +509,10 @@ async function ensureCameraStream() {
 
 async function stopCameraStream() {
   if (cameraStartPromise) {
-    cameraStartPromise = null;
+    try {
+      await cameraStartPromise;
+    } catch {
+    }
   }
 
   const serviceStopped = await requestCameraShutdown();
@@ -485,7 +628,17 @@ async function readRequestBody(request, maxBytes = 10 * 1024 * 1024) {
 
 async function readJsonBody(request) {
   const body = await readRequestBody(request);
-  return JSON.parse(body.toString("utf-8") || "{}");
+  const text = body.toString("utf-8").replace(/^\uFEFF/, "").trim();
+
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Request body must be valid JSON. ${error.message}`);
+  }
 }
 
 async function writeSessionMeta(sessionId, meta) {
@@ -505,7 +658,7 @@ async function writeRecordingMeta(recording) {
 }
 
 async function readRecordingMeta(recordingId) {
-  return JSON.parse(await readFile(recordingMetaPath(recordingId), "utf-8"));
+  return readJsonFile(recordingMetaPath(recordingId));
 }
 
 async function patchRecordingMeta(recordingId, patch) {
@@ -531,6 +684,80 @@ async function saveCloudinaryRecording(payload) {
   processRecordingAnalysis(recording.recording_id);
 
   return recording;
+}
+
+function headerValue(headers, name) {
+  const value = headers[name.toLowerCase()];
+
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function safeHeaderFilename(value, fallback = "gestureforge-recording.webm") {
+  let decoded = String(value ?? "").trim();
+
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch {
+  }
+
+  const safeName = basename(decoded || fallback).replace(/[^\w .-]+/g, "-").trim();
+
+  return safeName || fallback;
+}
+
+async function uploadRecordingFileToCloudinary(request) {
+  requireCloudinaryCredentials();
+
+  const body = await readRequestBody(request, maxRecordingUploadBytes);
+
+  if (!body.length) {
+    throw new Error("Recording upload body was empty.");
+  }
+
+  const filename = safeHeaderFilename(headerValue(request.headers, "x-recording-filename"));
+  const mimeType = String(headerValue(request.headers, "content-type") ?? "video/webm").split(";")[0].trim() || "video/webm";
+  const sessionId = String(headerValue(request.headers, "x-session-id") ?? "").trim();
+  const durationMs = Number(headerValue(request.headers, "x-recording-duration-ms") ?? 0) || 0;
+  const declaredSize = Number(headerValue(request.headers, "x-recording-size") ?? body.length) || body.length;
+  const result = await cloudinaryUpload("video", (formData) => {
+    formData.append("file", new Blob([body], { type: mimeType }), filename);
+    formData.append("tags", "gestureforge,screen-recording");
+
+    if (cloudinaryRecordingFolder) {
+      formData.append("folder", cloudinaryRecordingFolder);
+    }
+  }, { attempts: 3 });
+  const publicId = result.public_id;
+  const videoUrl = result.secure_url || result.url || (publicId ? cloudinaryDeliveryUrl({ publicId, resourceType: "video", format: result.format || "mp4" }) : "");
+
+  if (!publicId || !videoUrl) {
+    throw new Error("Cloudinary upload response did not include public_id or video URL.");
+  }
+
+  const asset = {
+    bytes: Number(result.bytes || declaredSize),
+    duration: Number(result.duration || durationMs / 1000 || 0),
+    format: result.format ? String(result.format) : null,
+    height: Number(result.height || 0),
+    original_filename: filename,
+    public_id: publicId,
+    resource_type: String(result.resource_type || "video"),
+    type: String(result.type || mimeType),
+    video_url: videoUrl,
+    width: Number(result.width || 0),
+  };
+  const recording = await saveCloudinaryRecording({
+    ...asset,
+    session_id: sessionId || null,
+    source: "gestureforge_backend_signed_upload",
+  });
+
+  return {
+    status: "cloudinary_recording_uploaded",
+    analysis_status: recording.analysis_status,
+    recording_id: recording.recording_id,
+    ...asset,
+  };
 }
 
 async function runRecordingVideoAnalyzer(recording) {
@@ -559,9 +786,9 @@ async function runRecordingVideoAnalyzer(recording) {
   } catch {
   }
 
-  await runCommand(pythonExecutable, args);
+  await runCommand(pythonExecutable, args, { env: pythonProcessEnv() });
 
-  return JSON.parse(await readFile(analysisPath, "utf-8"));
+  return readJsonFile(analysisPath);
 }
 
 function processRecordingAnalysis(recordingId) {
@@ -591,7 +818,10 @@ function processRecordingAnalysis(recordingId) {
       });
       if (analysisStatus !== "failed") {
         const latestRecording = await readRecordingMeta(normalizedId);
-        await saveClipPlan(latestRecording, analysis);
+        try {
+          await saveClipPlan(latestRecording, analysis);
+        } catch {
+        }
       }
       return analysis;
     } catch (error) {
@@ -731,20 +961,6 @@ function chooseClipAssets(candidate, audioSignals, catalog) {
   };
 }
 
-function transcriptSegmentsForClip(analysis, clipStart, clipEnd) {
-  const segments = Array.isArray(analysis?.transcription?.segments) ? analysis.transcription.segments : [];
-
-  return segments
-    .filter((segment) => overlapDuration(numberOr(segment.start), numberOr(segment.end), clipStart, clipEnd) > 0)
-    .slice(0, 6)
-    .map((segment) => ({
-      start: Math.max(0, Number((numberOr(segment.start) - clipStart).toFixed(2))),
-      end: Math.max(0.2, Number((numberOr(segment.end) - clipStart).toFixed(2))),
-      text: cleanOverlayText(segment.text, ""),
-    }))
-    .filter((segment) => segment.text);
-}
-
 function audioSignalsForClip(analysis, clipStart, clipEnd) {
   const events = Array.isArray(analysis?.audio?.events) ? analysis.audio.events : [];
 
@@ -799,6 +1015,399 @@ function highlightCandidates(analysis) {
     .filter((item) => item.end > item.start);
 }
 
+function compactVideoAnalysisForBackboard(analysis) {
+  const transcriptionSegments = Array.isArray(analysis?.transcription?.segments)
+    ? analysis.transcription.segments
+    : [];
+  const audioEvents = Array.isArray(analysis?.audio?.events) ? analysis.audio.events : [];
+  const highlights = Array.isArray(analysis?.highlights) ? analysis.highlights : [];
+  const funnyMoments = Array.isArray(analysis?.multimodal?.funny_moments)
+    ? analysis.multimodal.funny_moments
+    : [];
+
+  return {
+    status: analysis?.status,
+    transcription: {
+      text: String(analysis?.transcription?.text ?? "").slice(0, 2000),
+      segments: transcriptionSegments.slice(0, 80).map((segment) => ({
+        start: numberOr(segment.start),
+        end: numberOr(segment.end),
+        text: cleanOverlayText(segment.text, ""),
+      })),
+    },
+    audio: {
+      summary: analysis?.audio?.summary ?? {},
+      events: audioEvents.slice(0, 30).map((event) => ({
+        start: numberOr(event.start),
+        end: numberOr(event.end),
+        label: String(event.label || "audio"),
+        score: numberOr(event.score),
+        reason: cleanOverlayText(event.reason, ""),
+      })),
+    },
+    multimodal: {
+      summary: cleanOverlayText(analysis?.multimodal?.summary, ""),
+      funny_moments: funnyMoments.slice(0, 12),
+    },
+    highlights: highlights.slice(0, 12),
+    feedback: analysis?.feedback ?? {},
+    errors: Array.isArray(analysis?.errors) ? analysis.errors.slice(0, 8) : [],
+  };
+}
+
+function normalizeBackboardTextOverlays(rawClip, title, reason, duration) {
+  const overlays = Array.isArray(rawClip?.overlays) ? rawClip.overlays : [];
+  const textOverlays = overlays
+    .filter((overlay) => overlay?.type === "text")
+    .map((overlay) => normalizeOverlayText(overlay, duration))
+    .filter(Boolean)
+    .slice(0, 4);
+
+  if (!textOverlays.some((overlay) => overlay.role === "meme_title")) {
+    textOverlays.unshift({
+      type: "text",
+      role: "meme_title",
+      text: cleanOverlayText(title, "Funny moment").toUpperCase(),
+      position: "top",
+      start: 0,
+      duration: Number(Math.min(2.8, duration).toFixed(2)),
+    });
+  }
+
+  if (reason && textOverlays.length < 4 && !textOverlays.some((overlay) => overlay.role === "context")) {
+    textOverlays.push({
+      type: "text",
+      role: "context",
+      text: cleanOverlayText(reason, ""),
+      position: "bottom",
+      start: Number(Math.max(0, duration - 2.8).toFixed(2)),
+      duration: Number(Math.min(2.8, duration).toFixed(2)),
+    });
+  }
+
+  return textOverlays;
+}
+
+function cleanPlanDetail(value, fallback = "") {
+  return cleanOverlayText(value, fallback).slice(0, 240);
+}
+
+function normalizeBackboardEditNotes(rawClip, title, reason, audioSignals) {
+  const notes = rawClip?.edit_notes && typeof rawClip.edit_notes === "object" ? rawClip.edit_notes : {};
+  const assetRationale = rawClip?.asset_rationale && typeof rawClip.asset_rationale === "object" ? rawClip.asset_rationale : {};
+
+  return {
+    intent: cleanPlanDetail(notes.intent ?? rawClip?.edit_intent ?? reason, "Create a short funny gameplay beat."),
+    hook: cleanPlanDetail(notes.hook ?? rawClip?.hook ?? title, title),
+    setup: cleanPlanDetail(notes.setup ?? rawClip?.setup, ""),
+    payoff: cleanPlanDetail(notes.payoff ?? rawClip?.payoff, ""),
+    why_funny: cleanPlanDetail(notes.why_funny ?? rawClip?.why_funny ?? reason, reason),
+    timing_notes: cleanPlanDetail(notes.timing_notes ?? rawClip?.timing_notes, "Keep the moment tight and cut out dead air."),
+    visual_strategy: cleanPlanDetail(notes.visual_strategy ?? rawClip?.visual_strategy, "Crop to the clearest gameplay action in 9:16."),
+    audio_strategy: cleanPlanDetail(
+      notes.audio_strategy ?? rawClip?.audio_strategy,
+      audioSignals.length ? "Let the detected reaction audio drive the cut timing." : "Use original audio unless the selected sound effect adds a clearer joke.",
+    ),
+    asset_rationale: {
+      meme: cleanPlanDetail(assetRationale.meme ?? notes.meme_asset_reason ?? rawClip?.meme_asset_reason, ""),
+      sound: cleanPlanDetail(assetRationale.sound ?? notes.sound_asset_reason ?? rawClip?.sound_asset_reason, ""),
+    },
+    manual_tune_hint: cleanPlanDetail(notes.manual_tune_hint ?? rawClip?.manual_tune_hint, "Adjust start/end first, then rewrite the meme title if needed."),
+    risk_notes: cleanPlanDetail(notes.risk_notes ?? rawClip?.risk_notes, ""),
+  };
+}
+
+function normalizeBackboardClipPlan(recording, analysis, rawPlan, assetCatalog) {
+  const plan = rawPlan && typeof rawPlan === "object" ? rawPlan : {};
+  const sourceDuration = numberOr(
+    plan?.source?.duration,
+    numberOr(analysis?.audio?.summary?.duration, numberOr(recording.duration, 0)),
+  );
+  const sourceLimit = sourceDuration || Infinity;
+  const rawClips = Array.isArray(plan?.sequence?.clips)
+    ? plan.sequence.clips
+    : Array.isArray(plan?.clips) ? plan.clips : [];
+
+  if (!rawClips.length) {
+    throw new Error("Backboard clip plan did not include sequence.clips.");
+  }
+
+  const clips = rawClips.slice(0, 6).map((rawClip, index) => {
+    const rawTrim = rawClip?.trim && typeof rawClip.trim === "object" ? rawClip.trim : rawClip;
+    const start = Math.min(
+      Math.max(0, numberOr(rawTrim?.start, 0)),
+      Math.max(0, sourceLimit - 0.8),
+    );
+    const requestedEnd = numberOr(rawTrim?.end, start + numberOr(rawTrim?.duration, 4));
+    const end = sourceDuration
+      ? Math.min(sourceDuration, Math.max(start + 0.8, requestedEnd))
+      : Math.max(start + 0.8, requestedEnd);
+    const duration = end - start;
+    const title = cleanOverlayText(rawClip?.title ?? rawClip?.source_highlight?.title, `Clip ${index + 1}`);
+    const reason = cleanOverlayText(rawClip?.reason ?? rawClip?.source_highlight?.reason, "");
+    const memeAsset = validateRenderAssetSelection(
+      assetCatalog,
+      rawClip?.selected_assets?.meme ?? rawClip?.asset_hints?.meme,
+      "meme",
+    );
+    const soundAsset = validateRenderAssetSelection(
+      assetCatalog,
+      rawClip?.selected_assets?.sound ?? rawClip?.asset_hints?.sound,
+      "sound",
+    );
+    const audioSignals = audioSignalsForClip(analysis, start, end);
+    const textOverlays = normalizeBackboardTextOverlays(rawClip, title, reason, duration);
+    const rawZoom = rawClip?.effects?.zoom ?? {};
+    const rawFreeze = rawClip?.effects?.freeze_frame ?? {};
+    const editNotes = normalizeBackboardEditNotes(rawClip, title, reason, audioSignals);
+
+    return {
+      id: cleanOverlayText(rawClip?.id, `clip_${String(index + 1).padStart(2, "0")}`).replace(/[^a-zA-Z0-9_-]+/g, "_"),
+      order: index + 1,
+      source_public_id: recording.public_id,
+      trim: {
+        start: Number(start.toFixed(2)),
+        end: Number(end.toFixed(2)),
+        duration: Number(duration.toFixed(2)),
+      },
+      crop: {
+        aspect_ratio: "9:16",
+        width: 1080,
+        height: 1920,
+        mode: "fill",
+        gravity: "auto",
+      },
+      captions: [],
+      overlays: [
+        memeAsset
+          ? {
+              type: "asset",
+              role: "meme_reaction",
+              asset_id: memeAsset.id,
+              asset_path: memeAsset.path,
+              label: memeAsset.label,
+              position: "upper_right",
+              start: Number(Math.min(0.2, duration / 5).toFixed(2)),
+              duration: Number(Math.min(2.2, duration).toFixed(2)),
+            }
+          : null,
+        ...textOverlays,
+      ].filter(Boolean),
+      sound_effects: soundAsset
+        ? [
+            {
+              asset_id: soundAsset.id,
+              asset_path: soundAsset.path,
+              label: soundAsset.label,
+              start: Number(Math.min(Math.max(0.2, numberOr(rawClip?.sound_effects?.[0]?.start, duration * 0.2)), Math.max(0, duration - 0.5)).toFixed(2)),
+              volume: Math.max(0.15, Math.min(1, numberOr(rawClip?.sound_effects?.[0]?.volume, 0.45))),
+              mix: "duck_original_audio",
+            },
+          ]
+        : [],
+      selected_assets: {
+        meme: memeAsset?.id ?? null,
+        sound: soundAsset?.id ?? null,
+      },
+      effects: {
+        zoom: {
+          enabled: Boolean(rawZoom?.enabled),
+          style: String(rawZoom?.style || "subtle_punch_in"),
+          start: Number(Math.max(0, numberOr(rawZoom?.start, 0.25)).toFixed(2)),
+          duration: Number(Math.max(0.2, Math.min(duration, numberOr(rawZoom?.duration, 1.2))).toFixed(2)),
+        },
+        freeze_frame: {
+          enabled: Boolean(rawFreeze?.enabled),
+          at: Number(Math.max(0, Math.min(duration, numberOr(rawFreeze?.at, duration * 0.55))).toFixed(2)),
+          duration: Number(Math.max(0, Math.min(1.2, numberOr(rawFreeze?.duration, 0))).toFixed(2)),
+          reason: cleanOverlayText(rawFreeze?.reason, ""),
+        },
+      },
+      edit_notes: editNotes,
+      audio_signals: audioSignals,
+      source_highlight: {
+        title,
+        reason: editNotes.why_funny || reason,
+        source: cleanOverlayText(rawClip?.source_highlight?.source ?? rawClip?.source, "backboard_clip_plan"),
+        signals: Array.isArray(rawClip?.signals) ? rawClip.signals.map(String).slice(0, 8) : [],
+      },
+    };
+  });
+
+  return {
+    version: 1,
+    status: "planned",
+    generated_at: new Date().toISOString(),
+    generator: "backboard.io-clip-plan-v1",
+    backboard: {
+      provider: "backboard",
+      model_provider: plan?.backboard?.model_provider ?? plan?.model_provider,
+      model_name: plan?.backboard?.model_name ?? plan?.model_name,
+      assistant_id: plan?.backboard?.assistant_id ?? plan?.assistant_id,
+      thread_id: plan?.backboard?.thread_id ?? plan?.thread_id,
+    },
+    recording_id: recording.recording_id,
+    source: {
+      public_id: recording.public_id,
+      video_url: recording.video_url,
+      duration: sourceDuration || null,
+    },
+    output: {
+      format: "mp4",
+      width: 1080,
+      height: 1920,
+      aspect_ratio: "9:16",
+      video_codec: "h264",
+      audio_codec: "aac",
+      quality: "auto",
+      captions: false,
+    },
+    sequence: {
+      mode: "splice",
+      transition: "cut",
+      strategy: cleanPlanDetail(plan?.sequence?.strategy ?? plan?.summary, "Fast funny highlights with local meme and sound assets only."),
+      ad_insert: {
+        strategy: "fixed_after_first_clip",
+        note: "Entrepreneur ad is inserted after the first rendered clip during export.",
+      },
+      clips,
+    },
+    asset_policy: {
+      source: "local_asset_directory_only",
+      asset_root: "asset",
+      allowed_asset_ids: assetCatalog.map((asset) => asset.id),
+      note: "Backboard may only reference assets listed in asset_catalog. External meme or sound assets are rejected.",
+    },
+    asset_catalog: assetCatalog,
+    subtitles: {
+      enabled: false,
+      reason: "Disabled because speech recognition captions are unreliable for gameplay clips.",
+    },
+    meme_style: {
+      font_family: "Impact",
+      font_size: 78,
+      color: "white",
+      stroke: "black",
+      gravity: "north",
+    },
+    manual_tuning: {
+      editable_fields: [
+        "sequence.clips[].trim.start",
+        "sequence.clips[].trim.end",
+        "sequence.clips[].overlays[].text",
+        "sequence.clips[].selected_assets.meme",
+        "sequence.clips[].selected_assets.sound",
+        "sequence.clips[].effects.zoom.enabled",
+        "sequence.clips[].effects.freeze_frame.enabled",
+      ],
+    },
+  };
+}
+
+async function generateClipPlanWithBackboard(recording, analysis, assetCatalog) {
+  const compactAnalysis = compactVideoAnalysisForBackboard(analysis);
+  const allowedAssetIds = assetCatalog.map((asset) => asset.id);
+  const content = [
+    "Generate the final automatic gameplay clip edit plan for GestureForge.",
+    "You are choosing the actual clips and edit instructions. Return compact valid JSON only.",
+    "",
+    "Hard rules:",
+    "- Use only moments supported by the provided analysis. Do not invent unsupported events.",
+    "- Clips must be 2 to 12 seconds where possible, ordered by timeline.",
+    "- Output is vertical 9:16, 1080x1920, mp4.",
+    `- You may only choose these local asset ids: ${allowedAssetIds.join(", ")}.`,
+    "- Do not invent external meme images, sound effects, URLs, filenames, or asset ids.",
+    "- selected_assets.meme may be null or one allowed meme id.",
+    "- selected_assets.sound may be null or one allowed sound id.",
+    "- Do not create subtitles or transcript captions. captions must be omitted or an empty array.",
+    "- Treat speech transcription as weak context only; do not quote it as on-screen text.",
+    "- Include short meme_title text overlays only for the joke beat, not subtitles.",
+    "- Add detailed editor notes explaining hook, setup, payoff, timing, asset choices, and manual tuning hints.",
+    "- The final export will insert one entrepreneur ad after the first clip; plan around that break.",
+    "",
+    "Return this JSON shape:",
+    JSON.stringify({
+      sequence: {
+        strategy: "overall edit strategy and pacing",
+        clips: [
+          {
+            id: "clip_01",
+            title: "short title",
+            reason: "why this clip should be cut",
+            trim: { start: 0, end: 4.2 },
+            selected_assets: { meme: "meme_laugh", sound: "sound_wtf" },
+            overlays: [{ type: "text", role: "meme_title", text: "TITLE", position: "top", start: 0, duration: 2.2 }],
+            sound_effects: [{ asset_id: "sound_wtf", start: 0.4, volume: 0.45 }],
+            effects: {
+              zoom: { enabled: true, start: 0.2, duration: 1.1, style: "subtle_punch_in" },
+              freeze_frame: { enabled: false, at: 0, duration: 0, reason: "" },
+            },
+            edit_notes: {
+              intent: "what this clip should achieve",
+              hook: "what catches attention in the first second",
+              setup: "what the viewer needs to understand",
+              payoff: "the funny or surprising beat",
+              why_funny: "why the moment works",
+              timing_notes: "where to tighten or extend the cut",
+              visual_strategy: "what should stay visible after 9:16 crop",
+              audio_strategy: "how original audio and allowed sound assets should be mixed",
+              asset_rationale: { meme: "why this meme asset fits", sound: "why this sound asset fits" },
+              manual_tune_hint: "what the user should tweak first",
+              risk_notes: "any uncertainty or quality concern",
+            },
+            signals: ["visual", "audio"],
+          },
+        ],
+      },
+      summary: "one sentence edit strategy",
+    }),
+    "",
+    "Recording:",
+    JSON.stringify({
+      recording_id: recording.recording_id,
+      public_id: recording.public_id,
+      duration: numberOr(recording.duration, compactAnalysis.audio.summary?.duration),
+    }),
+    "",
+    "Allowed asset catalog:",
+    JSON.stringify(assetCatalog, null, 2),
+    "",
+    "Video analysis:",
+    JSON.stringify(compactAnalysis, null, 2),
+  ].join("\n");
+  const response = await sendBackboardMessage({
+    content,
+    jsonOutput: true,
+    memory: process.env.BACKBOARD_ANALYSIS_MEMORY_MODE ?? backboardMemoryMode,
+    systemPrompt: [
+      "You are GestureForge's automatic gameplay video editor.",
+      "You convert gameplay analysis into a concrete Cloudinary edit plan.",
+      "Return valid JSON only, obey the local asset allowlist exactly, and never generate subtitles.",
+    ].join(" "),
+  });
+  const parsedPlan = jsonObjectFromModelText(response.content ?? response.message ?? response.text ?? response.output, "Backboard clip plan");
+  const contentError = backboardContentError(parsedPlan, "Backboard clip plan");
+
+  if (contentError) {
+    throw new Error(contentError);
+  }
+
+  return normalizeBackboardClipPlan(
+    recording,
+    analysis,
+    {
+      ...parsedPlan,
+      backboard: {
+        model_provider: response.model_provider,
+        model_name: response.model_name,
+        assistant_id: response.assistant_id,
+        thread_id: response.thread_id,
+      },
+    },
+    assetCatalog,
+  );
+}
+
 function buildClipPlan(recording, analysis, assetCatalog) {
   const candidates = highlightCandidates(analysis)
     .sort((a, b) => b.score - a.score)
@@ -833,7 +1442,7 @@ function buildClipPlan(recording, analysis, assetCatalog) {
         mode: "fill",
         gravity: "auto",
       },
-      captions: transcriptSegmentsForClip(analysis, paddedStart, paddedEnd),
+      captions: [],
       overlays: [
         selectedAssets.meme
           ? {
@@ -894,6 +1503,22 @@ function buildClipPlan(recording, analysis, assetCatalog) {
           reason: strongAudio ? "Emphasize scream/laughter reaction." : "",
         },
       },
+      edit_notes: {
+        intent: cleanPlanDetail(candidate.reason, "Create a short funny gameplay beat."),
+        hook: cleanPlanDetail(candidate.title, "Funny moment"),
+        setup: "",
+        payoff: cleanPlanDetail(candidate.reason, ""),
+        why_funny: cleanPlanDetail(candidate.reason, ""),
+        timing_notes: "Keep the cut tight around the detected reaction and remove quiet setup.",
+        visual_strategy: "Crop to 9:16 while keeping the main gameplay action centered.",
+        audio_strategy: strongAudio ? "Keep the original reaction loud and add the selected sound lightly." : "Use the selected sound effect as a small punchline accent.",
+        asset_rationale: {
+          meme: selectedAssets.meme ? `${selectedAssets.meme.label} matches the reaction beat.` : "",
+          sound: selectedAssets.sound ? `${selectedAssets.sound.label} supports the audio cue.` : "",
+        },
+        manual_tune_hint: "Adjust trim timing before changing assets.",
+        risk_notes: "",
+      },
       audio_signals: audioSignals,
       source_highlight: candidate,
     };
@@ -918,10 +1543,16 @@ function buildClipPlan(recording, analysis, assetCatalog) {
       video_codec: "h264",
       audio_codec: "aac",
       quality: "auto",
+      captions: false,
     },
     sequence: {
       mode: "splice",
       transition: "cut",
+      strategy: "Fast funny highlights with local meme and sound assets only.",
+      ad_insert: {
+        strategy: "fixed_after_first_clip",
+        note: "Entrepreneur ad is inserted after the first rendered clip during export.",
+      },
       clips,
     },
     asset_policy: {
@@ -931,12 +1562,9 @@ function buildClipPlan(recording, analysis, assetCatalog) {
       note: "Clip plan may only reference assets listed in asset_catalog.",
     },
     asset_catalog: assetCatalog,
-    subtitle_style: {
-      font_family: "Arial",
-      font_size: 64,
-      color: "white",
-      background: "rgba(0,0,0,0.58)",
-      gravity: "south",
+    subtitles: {
+      enabled: false,
+      reason: "Disabled because speech recognition captions are unreliable for gameplay clips.",
     },
     meme_style: {
       font_family: "Impact",
@@ -961,7 +1589,24 @@ function buildClipPlan(recording, analysis, assetCatalog) {
 
 async function saveClipPlan(recording, analysis) {
   const assetCatalog = await localClipAssetCatalog();
-  const plan = buildClipPlan(recording, analysis, assetCatalog);
+
+  await patchRecordingMeta(recording.recording_id, {
+    clip_plan_status: "planning",
+    clip_plan_error: undefined,
+  });
+
+  let plan;
+
+  try {
+    plan = await generateClipPlanWithBackboard(recording, analysis, assetCatalog);
+  } catch (error) {
+    await patchRecordingMeta(recording.recording_id, {
+      clip_plan_status: "failed",
+      clip_plan_error: error.message,
+      clip_plan_failed_at: new Date().toISOString(),
+    });
+    throw error;
+  }
 
   await mkdir(recordingPath(recording.recording_id), { recursive: true });
   await writeFile(recordingPath(recording.recording_id, "clip-plan.json"), JSON.stringify(plan, null, 2), "utf-8");
@@ -1063,6 +1708,24 @@ function cloudinaryAssetPublicId(asset) {
 
 function cloudinaryRenderPublicId(recording, ...parts) {
   return [cloudinaryRenderFolder, recording.recording_id, ...parts]
+    .map((part) => String(part ?? "").replace(/^\/+|\/+$/g, ""))
+    .filter(Boolean)
+    .join("/");
+}
+
+function cloudinarySafeIdPart(value, fallback = "asset") {
+  const clean = String(value ?? "")
+    .toLowerCase()
+    .replace(/\.[a-z0-9]+$/i, "")
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72);
+
+  return clean || fallback;
+}
+
+function companyAdRenderPublicId(renderId, ...parts) {
+  return [cloudinaryRenderFolder, "company-ads", renderId, ...parts]
     .map((part) => String(part ?? "").replace(/^\/+|\/+$/g, ""))
     .filter(Boolean)
     .join("/");
@@ -1187,7 +1850,7 @@ function normalizeOverlayText(overlay, fallbackDuration) {
 
   return {
     type: "text",
-    role: String(overlay.role || "caption"),
+    role: String(overlay.role || "text_note"),
     text,
     position: String(overlay.position || (overlay.role === "meme_title" ? "top" : "bottom")),
     start: Number(start.toFixed(2)),
@@ -1231,15 +1894,6 @@ function normalizeRenderableClip(recording, plan, clip, index, assetCatalog) {
     });
   }
 
-  const captions = (Array.isArray(clip?.captions) ? clip.captions : [])
-    .map((caption) => ({
-      start: Number(Math.max(0, numberOr(caption.start, 0)).toFixed(2)),
-      end: Number(Math.min(duration, Math.max(0.2, numberOr(caption.end, 0.2))).toFixed(2)),
-      text: cleanOverlayText(caption.text, ""),
-    }))
-    .filter((caption) => caption.text && caption.end > caption.start)
-    .slice(0, 5);
-
   return {
     ...clip,
     id: clip?.id || `clip_${String(index + 1).padStart(2, "0")}`,
@@ -1257,7 +1911,7 @@ function normalizeRenderableClip(recording, plan, clip, index, assetCatalog) {
       mode: "fill",
       gravity: "auto",
     },
-    captions,
+    captions: [],
     overlays: [
       memeAsset
         ? {
@@ -1354,19 +2008,7 @@ function buildTextOverlayTransformation(overlay, fontFamily, fontSize) {
     return "";
   }
 
-  return `l_text:${fontFamily}_${fontSize}_bold:${text},co_white,b_rgb:00000099/fl_layer_apply,${placement},so_${cloudinaryNumber(start)},du_${cloudinaryNumber(duration)}`;
-}
-
-function buildCaptionOverlayTransformation(caption) {
-  const start = Math.max(0, numberOr(caption.start, 0));
-  const duration = Math.max(0.25, numberOr(caption.end, start + 1) - start);
-  const text = cloudinaryText(caption.text);
-
-  if (!text) {
-    return "";
-  }
-
-  return `l_text:Arial_58_bold:${text},co_white,b_rgb:00000099/fl_layer_apply,g_south,y_58,so_${cloudinaryNumber(start)},du_${cloudinaryNumber(duration)}`;
+  return `l_text:${fontFamily}_${fontSize}_bold:${text},co_white,b_rgb:000000/fl_layer_apply,${placement},so_${cloudinaryNumber(start)},du_${cloudinaryNumber(duration)}`;
 }
 
 function buildMemeOverlayTransformation(overlay, syncedAsset) {
@@ -1391,7 +2033,7 @@ function buildAudioOverlayTransformation(soundEffect, syncedAsset, clipDuration)
   const volume = Math.round(Math.max(0.1, Math.min(1, numberOr(soundEffect.volume, 0.45))) * 100);
   const publicId = cloudinaryLayerPublicId(syncedAsset.cloudinary_public_id);
 
-  return `l_audio:${publicId},du_${cloudinaryNumber(duration)}/e_volume:${volume}/fl_layer_apply,so_${cloudinaryNumber(start)}`;
+  return `l_audio:${publicId},du_${cloudinaryNumber(duration)},e_volume:${volume}/fl_layer_apply,so_${cloudinaryNumber(start)}`;
 }
 
 function buildEditedClipUrl(recording, clip, syncedAssets) {
@@ -1432,14 +2074,6 @@ function buildEditedClipUrl(recording, clip, syncedAssets) {
       }
     });
 
-  clip.captions?.slice(0, 4).forEach((caption) => {
-    const component = buildCaptionOverlayTransformation(caption);
-
-    if (component) {
-      transformations.push(component);
-    }
-  });
-
   clip.sound_effects?.slice(0, 1).forEach((soundEffect) => {
     const component = buildAudioOverlayTransformation(soundEffect, syncedAssets[soundEffect.asset_id], numberOr(clip.trim?.duration, 3));
 
@@ -1449,7 +2083,7 @@ function buildEditedClipUrl(recording, clip, syncedAssets) {
   });
 
   if (clip.effects?.zoom?.enabled) {
-    transformations.push("c_fill,w_1188,h_2112,g_auto/c_crop,w_1080,h_1920,g_auto");
+    transformations.push("c_crop,w_972,h_1728,g_center/c_fill,w_1080,h_1920,g_center");
   }
 
   transformations.push("q_auto,vc_h264,ac_aac");
@@ -1462,14 +2096,440 @@ function buildEditedClipUrl(recording, clip, syncedAssets) {
   });
 }
 
-async function uploadCloudinaryRemoteVideo(sourceUrl, publicId, tags = "gestureforge,gestureforge-render") {
+async function uploadCloudinaryRemoteVideo(sourceUrl, publicId, tags = "gestureforge,gestureforge-render", options = {}) {
   return cloudinaryUpload("video", (formData) => {
     formData.append("file", sourceUrl);
     formData.append("public_id", publicId);
     formData.append("overwrite", "true");
     formData.append("invalidate", "true");
     formData.append("tags", tags);
+  }, { attempts: options.attempts ?? 3 });
+}
+
+function dataUrlAudioParts(value) {
+  const match = String(value ?? "").match(/^data:([^;,]+);base64,(.+)$/i);
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    mime_type: match[1],
+    audio_base64: match[2],
+  };
+}
+
+function audioMimeExtension(mimeType) {
+  const normalized = String(mimeType ?? "").toLowerCase();
+
+  if (normalized.includes("wav")) {
+    return ".wav";
+  }
+
+  if (normalized.includes("mp4") || normalized.includes("m4a")) {
+    return ".m4a";
+  }
+
+  return ".mp3";
+}
+
+function resolveGeneratedVoiceAudio(payload) {
+  const script = payload?.plan?.script && typeof payload.plan.script === "object" ? payload.plan.script : {};
+  const audio = payload?.audio && typeof payload.audio === "object" ? payload.audio : {};
+  const dataUrl = dataUrlAudioParts(payload?.audio_url) || dataUrlAudioParts(audio.audio_url) || dataUrlAudioParts(script.audio_url);
+  const audioBase64 = String(payload?.audio_base64 ?? audio.audio_base64 ?? script.audio_base64 ?? dataUrl?.audio_base64 ?? "")
+    .replace(/\s+/g, "");
+  const mimeType = String(payload?.mime_type ?? audio.mime_type ?? script.mime_type ?? dataUrl?.mime_type ?? "audio/mpeg").trim() || "audio/mpeg";
+
+  if (!audioBase64) {
+    throw new Error("Generate voice audio before rendering the Cloudinary video.");
+  }
+
+  const bytes = Buffer.from(audioBase64, "base64");
+
+  if (!bytes.length) {
+    throw new Error("Generated voice audio was empty.");
+  }
+
+  return {
+    bytes,
+    mime_type: mimeType,
+    extension: audioMimeExtension(mimeType),
+  };
+}
+
+async function uploadCompanyAdBaseVideoToCloudinary(filename = companyAdVideoAsset) {
+  const safeName = basename(String(filename || companyAdVideoAsset));
+  const filePath = resolve(assetDir, safeName);
+
+  if (filePath !== resolve(assetDir, safeName) || !filePath.startsWith(assetDir + sep)) {
+    throw new Error("Video asset must live inside the asset directory.");
+  }
+
+  const info = await stat(filePath);
+
+  if (!info.isFile()) {
+    throw new Error(`Local video asset is missing: ${safeName}`);
+  }
+
+  const bytes = await readFile(filePath);
+  const mimeType = contentTypes[extname(filePath).toLowerCase()] ?? "video/mp4";
+  const publicId = `${cloudinaryRenderFolder}/company-ads/base/${cloudinarySafeIdPart(safeName, "base-video")}`;
+  const result = await cloudinaryUpload("video", (formData) => {
+    formData.append("file", new Blob([bytes], { type: mimeType }), safeName);
+    formData.append("public_id", publicId);
+    formData.append("overwrite", "true");
+    formData.append("invalidate", "true");
+    formData.append("tags", "gestureforge,gestureforge-company-ad,gestureforge-base-video");
   }, { attempts: 3 });
+  const resolvedPublicId = result.public_id || publicId;
+
+  return {
+    asset_filename: safeName,
+    public_id: resolvedPublicId,
+    video_url: result.secure_url || result.url || cloudinaryDeliveryUrl({ publicId: resolvedPublicId, resourceType: "video", format: "mp4" }),
+    duration: numberOr(result.duration, 0) || null,
+  };
+}
+
+function normalizeCompanyAdInsert(ad) {
+  const publicId = String(ad?.final_public_id ?? ad?.public_id ?? "").trim();
+
+  if (!publicId) {
+    return null;
+  }
+
+  const publicIdParts = publicId.split("/").filter(Boolean);
+  const fallbackAdId = publicIdParts[publicIdParts.length - 1] || "company-ad";
+  const productName = String(ad?.product_name ?? ad?.plan?.productName ?? "").trim();
+  const brandName = String(ad?.brand_name ?? ad?.plan?.brandName ?? "").trim();
+  const sourceVideoAsset = String(ad?.source_video_asset ?? ad?.asset_filename ?? companyAdVideoAsset).trim();
+  const videoUrl = String(ad?.video_url ?? ad?.final_url ?? "").trim() || cloudinaryDeliveryUrl({
+    publicId,
+    resourceType: "video",
+    format: "mp4",
+  });
+
+  return {
+    ad_id: cloudinarySafeIdPart(ad?.ad_id ?? ad?.render_id ?? fallbackAdId, "company-ad"),
+    title: String(ad?.title || productName || brandName || sourceVideoAsset).trim() || sourceVideoAsset,
+    source: String(ad?.source ?? "entrepreneur_generated_ad").trim() || "entrepreneur_generated_ad",
+    public_id: publicId,
+    video_url: videoUrl,
+    download_url: String(ad?.download_url ?? "").trim() || cloudinaryDeliveryUrl({
+      publicId,
+      resourceType: "video",
+      transformations: ["fl_attachment"],
+      format: "mp4",
+    }),
+    duration: numberOr(ad?.duration, 0) || null,
+    source_video_asset: sourceVideoAsset,
+    generated_at: String(ad?.generated_at ?? ad?.created_at ?? "").trim() || null,
+  };
+}
+
+async function writeCompanyAdMeta(ad) {
+  const normalized = normalizeCompanyAdInsert(ad);
+
+  if (!normalized) {
+    return null;
+  }
+
+  const adId = companyAdIdFromPathValue(normalized.ad_id);
+  const stored = {
+    ...ad,
+    ...normalized,
+    ad_id: adId,
+    status: String(ad?.status ?? "rendered"),
+    final_public_id: ad?.final_public_id ?? normalized.public_id,
+    generated_at: normalized.generated_at ?? new Date().toISOString(),
+  };
+
+  await mkdir(companyAdsDir, { recursive: true });
+  await writeFile(companyAdMetaPath(adId), JSON.stringify(stored, null, 2), "utf-8");
+
+  return stored;
+}
+
+async function listStoredCompanyAds() {
+  let entries = [];
+
+  try {
+    entries = await readdir(companyAdsDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const ads = [];
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".json")) {
+      continue;
+    }
+
+    const stored = await readOptionalJson(resolve(companyAdsDir, entry.name));
+    const normalized = normalizeCompanyAdInsert(stored);
+
+    if (normalized) {
+      ads.push({
+        ...stored,
+        ...normalized,
+      });
+    }
+  }
+
+  return ads.sort((left, right) => {
+    const leftTime = Date.parse(left.generated_at ?? "") || 0;
+    const rightTime = Date.parse(right.generated_at ?? "") || 0;
+    return rightTime - leftTime;
+  });
+}
+
+function withAdInsertPlacement(ad) {
+  return ad
+    ? {
+        ...ad,
+        inserted: true,
+        strategy: "fixed_after_first_clip",
+        insert_after_clip_index: 0,
+      }
+    : null;
+}
+
+async function fixedCompanyAdInsert() {
+  const baseVideo = await uploadCompanyAdBaseVideoToCloudinary(companyAdVideoAsset);
+  const stored = await writeCompanyAdMeta({
+    ad_id: "fixed-company-ad",
+    status: "rendered",
+    source: "fixed_company_ad_asset",
+    title: "Caffeinated Chewing Gum",
+    generated_at: new Date().toISOString(),
+    duration: baseVideo.duration,
+    source_video_asset: baseVideo.asset_filename,
+    public_id: baseVideo.public_id,
+    final_public_id: baseVideo.public_id,
+    video_url: baseVideo.video_url,
+  });
+
+  return withAdInsertPlacement(stored);
+}
+
+async function selectEntrepreneurAdInsert() {
+  const storedAds = await listStoredCompanyAds();
+  const generatedAd = storedAds.find((ad) => ad.source === "entrepreneur_generated_ad");
+  const fixedAd = storedAds.find((ad) => ad.source === "fixed_company_ad_asset");
+
+  if (generatedAd) {
+    return withAdInsertPlacement(generatedAd);
+  }
+
+  if (fixedAd) {
+    return withAdInsertPlacement(fixedAd);
+  }
+
+  return fixedCompanyAdInsert();
+}
+
+function clipRendersWithAdInsert(clipRenders, adInsert) {
+  if (!adInsert?.public_id || !clipRenders.length) {
+    return clipRenders;
+  }
+
+  const insertAfterIndex = Math.min(
+    clipRenders.length - 1,
+    Math.max(0, Number(adInsert.insert_after_clip_index ?? 0) || 0),
+  );
+  const adRender = {
+    clip_id: `ad_${adInsert.ad_id}`,
+    role: "entrepreneur_ad",
+    is_ad: true,
+    ad_id: adInsert.ad_id,
+    title: adInsert.title,
+    source: adInsert.source,
+    public_id: adInsert.public_id,
+    video_url: adInsert.video_url,
+    duration: adInsert.duration,
+  };
+
+  return [
+    ...clipRenders.slice(0, insertAfterIndex + 1),
+    adRender,
+    ...clipRenders.slice(insertAfterIndex + 1),
+  ];
+}
+
+async function uploadGeneratedVoiceToCloudinary(payload, renderId) {
+  const audio = payload?.bytes ? payload : resolveGeneratedVoiceAudio(payload);
+  const publicId = companyAdRenderPublicId(renderId, "voice");
+  const result = await cloudinaryUpload("video", (formData) => {
+    formData.append("file", new Blob([audio.bytes], { type: audio.mime_type }), `voice${audio.extension}`);
+    formData.append("public_id", publicId);
+    formData.append("overwrite", "true");
+    formData.append("invalidate", "true");
+    formData.append("tags", "gestureforge,gestureforge-company-ad,gestureforge-voice");
+  }, { attempts: 3 });
+  const resolvedPublicId = result.public_id || publicId;
+
+  return {
+    public_id: resolvedPublicId,
+    audio_url: result.secure_url || result.url || cloudinaryDeliveryUrl({ publicId: resolvedPublicId, resourceType: "video", format: audio.extension.slice(1) || "mp3" }),
+    mime_type: audio.mime_type,
+    duration: numberOr(result.duration, 0) || null,
+  };
+}
+
+function companyAdDurationFromPlan(plan) {
+  const segments = Array.isArray(plan?.script?.segments) ? plan.script.segments : [];
+  const lastEnd = segments.reduce((maxEnd, segment) => Math.max(maxEnd, numberOr(segment?.end, 0)), 0);
+
+  return Math.max(companyAdMinVoiceSeconds, Math.min(companyAdMaxVoiceSeconds, lastEnd || companyAdMaxVoiceSeconds));
+}
+
+function buildCompanyAdRenderUrl(baseVideo, voiceAudio, duration) {
+  const renderDuration = cloudinaryNumber(duration || 10, 10);
+  const transformations = [
+    `so_0,du_${renderDuration},c_fill,w_1080,h_1920,g_center`,
+    `l_audio:${cloudinaryLayerPublicId(voiceAudio.public_id)}/du_${renderDuration}/e_volume:100/fl_layer_apply,so_0`,
+    "q_auto,vc_h264,ac_aac",
+  ];
+
+  return cloudinaryDeliveryUrl({
+    publicId: baseVideo.public_id,
+    resourceType: "video",
+    transformations,
+    format: "mp4",
+  });
+}
+
+function normalizeNotificationEmail(value) {
+  const email = String(value ?? "").trim().toLowerCase();
+  return email && email.includes("@") ? email : "";
+}
+
+async function sendVideoReadyEmail({ email, name, brandName, productName, videoUrl, downloadUrl }) {
+  const recipientEmail = normalizeNotificationEmail(email);
+
+  if (!recipientEmail) {
+    return { status: "skipped", reason: "No logged-in email was provided." };
+  }
+
+  if (!pingramApiKey) {
+    return { status: "skipped", reason: "PINGRAM_API_KEY is not configured." };
+  }
+
+  try {
+    const { Pingram } = await import("pingram");
+    const pingram = new Pingram({ apiKey: pingramApiKey, region: pingramRegion });
+    const safeName = escapeHtml(name || recipientEmail);
+    const safeBrandName = escapeHtml(brandName || "Your brand");
+    const safeProductName = escapeHtml(productName || "your product");
+    const safeVideoUrl = escapeHtml(videoUrl);
+    const safeDownloadUrl = escapeHtml(downloadUrl || videoUrl);
+
+    await pingram.send({
+      type: pingramVideoReadyType,
+      to: { email: recipientEmail },
+      email: {
+        subject: `Your ${safeProductName} ad video is ready`,
+        html: [
+          `<h1>Your GestureForge video is ready</h1>`,
+          `<p>Hi ${safeName}, your ${safeBrandName} ad for <strong>${safeProductName}</strong> has finished rendering and was saved on Cloudinary.</p>`,
+          `<p><a href="${safeVideoUrl}">Watch the generated video</a></p>`,
+          `<p><a href="${safeDownloadUrl}">Download the MP4</a></p>`,
+        ].join(""),
+        senderName: pingramSenderName,
+        senderEmail: pingramSenderEmail,
+      },
+    });
+
+    return {
+      status: "sent",
+      recipient_email: recipientEmail,
+      pingram_type: pingramVideoReadyType,
+      pingram_region: pingramRegion,
+    };
+  } catch (error) {
+    const status = error.response?.status;
+    const statusText = error.response?.statusText;
+    const details = [status, statusText, error.message].filter(Boolean).join(" ");
+
+    return {
+      status: "failed",
+      recipient_email: recipientEmail,
+      reason: details || "Pingram send failed.",
+      pingram_type: pingramVideoReadyType,
+      pingram_region: pingramRegion,
+    };
+  }
+}
+
+async function renderCompanyAdWithCloudinary(payload) {
+  const plan = payload?.plan && typeof payload.plan === "object" ? payload.plan : {};
+  const voiceInput = resolveGeneratedVoiceAudio(payload);
+
+  requireCloudinaryCredentials();
+
+  const renderId = randomUUID();
+  const duration = companyAdDurationFromPlan(plan);
+  const baseVideo = await uploadCompanyAdBaseVideoToCloudinary(payload?.video_asset || plan?.video?.source_asset || companyAdVideoAsset);
+  const voiceAudio = await uploadGeneratedVoiceToCloudinary(voiceInput, renderId);
+  const finalTransformUrl = buildCompanyAdRenderUrl(baseVideo, voiceAudio, duration);
+  const finalPublicId = companyAdRenderPublicId(renderId, "final");
+  const finalUpload = await uploadCloudinaryRemoteVideo(
+    finalTransformUrl,
+    finalPublicId,
+    "gestureforge,gestureforge-company-ad,gestureforge-final-render",
+  );
+  const resolvedFinalPublicId = finalUpload.public_id || finalPublicId;
+  const resolvedFinalUrl = finalUpload.secure_url || finalUpload.url || cloudinaryDeliveryUrl({
+    publicId: resolvedFinalPublicId,
+    resourceType: "video",
+    format: "mp4",
+  });
+  const resolvedDownloadUrl = cloudinaryDeliveryUrl({
+    publicId: resolvedFinalPublicId,
+    resourceType: "video",
+    transformations: ["fl_attachment"],
+    format: "mp4",
+  });
+  const notification = await sendVideoReadyEmail({
+    email: payload?.recipient_email ?? payload?.user?.email,
+    name: payload?.recipient_name ?? payload?.user?.name,
+    brandName: plan.brandName,
+    productName: plan.productName,
+    videoUrl: resolvedFinalUrl,
+    downloadUrl: resolvedDownloadUrl,
+  });
+
+  const renderResult = {
+    ad_id: renderId,
+    status: "rendered",
+    source: "entrepreneur_generated_ad",
+    title: String(plan.productName ?? plan.brandName ?? baseVideo.asset_filename ?? companyAdVideoAsset).trim() || companyAdVideoAsset,
+    brand_name: String(plan.brandName ?? "").trim(),
+    product_name: String(plan.productName ?? "").trim(),
+    provider: "cloudinary",
+    cloudinary_saved: true,
+    video_prompt: String(payload?.video_prompt ?? plan.video?.regeneratePrompt ?? "").trim(),
+    email_status: notification.status,
+    email_error: notification.reason,
+    notification,
+    generated_at: new Date().toISOString(),
+    duration,
+    source_video_asset: baseVideo.asset_filename,
+    source_public_id: baseVideo.public_id,
+    source_video_url: baseVideo.video_url,
+    audio_public_id: voiceAudio.public_id,
+    audio_url: voiceAudio.audio_url,
+    final_public_id: resolvedFinalPublicId,
+    video_url: resolvedFinalUrl,
+    download_url: resolvedDownloadUrl,
+    transform_url: finalTransformUrl,
+  };
+
+  await writeCompanyAdMeta(renderResult);
+
+  return renderResult;
 }
 
 function buildFinalSpliceUrl(clipRenders) {
@@ -1480,12 +2540,8 @@ function buildFinalSpliceUrl(clipRenders) {
   }
 
   const transformations = [
-    "c_fill,w_1080,h_1920,g_auto",
-    ...restClips.flatMap((clip) => [
-      `l_video:${cloudinaryLayerPublicId(clip.public_id)}`,
-      "c_fill,w_1080,h_1920,g_auto",
-      "fl_layer_apply,fl_splice",
-    ]),
+    "c_fill,w_1080,h_1920,g_center",
+    ...restClips.map((clip) => `l_video:${cloudinaryLayerPublicId(clip.public_id)},c_fill,w_1080,h_1920,g_center,fl_splice`),
     "q_auto,vc_h264,ac_aac",
   ];
 
@@ -1501,9 +2557,11 @@ async function renderRecordingClipPlan(recordingId, proposedPlan) {
   requireCloudinaryCredentials();
 
   const recording = await readRecordingMeta(recordingId);
-  const savedPlan = await getOrCreateClipPlan(recording.recording_id);
+  const planInput = proposedPlan && typeof proposedPlan === "object"
+    ? proposedPlan
+    : await getOrCreateClipPlan(recording.recording_id);
   const assetCatalog = await localClipAssetCatalog();
-  const renderPlan = normalizeRenderablePlan(recording, proposedPlan && typeof proposedPlan === "object" ? proposedPlan : savedPlan, assetCatalog);
+  const renderPlan = normalizeRenderablePlan(recording, planInput, assetCatalog);
 
   await patchRecordingMeta(recording.recording_id, {
     clip_render_status: "syncing_assets",
@@ -1520,7 +2578,7 @@ async function renderRecordingClipPlan(recordingId, proposedPlan) {
   for (const clip of renderPlan.sequence.clips) {
     const sourceTransformUrl = buildEditedClipUrl(recording, clip, syncedAssets);
     const publicId = cloudinaryRenderPublicId(recording, "clips", clip.id);
-    const upload = await uploadCloudinaryRemoteVideo(sourceTransformUrl, publicId);
+    const upload = await uploadCloudinaryRemoteVideo(sourceTransformUrl, publicId, "gestureforge,gestureforge-render", { attempts: 6 });
 
     clipRenders.push({
       clip_id: clip.id,
@@ -1532,12 +2590,19 @@ async function renderRecordingClipPlan(recordingId, proposedPlan) {
   }
 
   await patchRecordingMeta(recording.recording_id, {
+    clip_render_status: "preparing_ad",
+  });
+
+  const adInsert = await selectEntrepreneurAdInsert();
+  const spliceSequence = clipRendersWithAdInsert(clipRenders, adInsert);
+
+  await patchRecordingMeta(recording.recording_id, {
     clip_render_status: "splicing",
   });
 
-  const finalTransformUrl = buildFinalSpliceUrl(clipRenders);
+  const finalTransformUrl = buildFinalSpliceUrl(spliceSequence);
   const finalPublicId = cloudinaryRenderPublicId(recording, "final");
-  const finalUpload = await uploadCloudinaryRemoteVideo(finalTransformUrl, finalPublicId, "gestureforge,gestureforge-final-render");
+  const finalUpload = await uploadCloudinaryRemoteVideo(finalTransformUrl, finalPublicId, "gestureforge,gestureforge-final-render", { attempts: 8 });
   const resolvedFinalPublicId = finalUpload.public_id || finalPublicId;
   const resolvedFinalUrl = finalUpload.secure_url || finalUpload.url || cloudinaryDeliveryUrl({ publicId: resolvedFinalPublicId, resourceType: "video", format: "mp4" });
   const resolvedDownloadUrl = cloudinaryDeliveryUrl({
@@ -1558,6 +2623,16 @@ async function renderRecordingClipPlan(recordingId, proposedPlan) {
     final_transform_url: finalTransformUrl,
     download_url: resolvedDownloadUrl,
     clip_renders: clipRenders,
+    splice_sequence: spliceSequence,
+    ad_insert: adInsert
+      ? {
+          ...adInsert,
+          insert_after_clip_id: clipRenders[Math.min(clipRenders.length - 1, adInsert.insert_after_clip_index)]?.clip_id ?? null,
+        }
+      : {
+          inserted: false,
+          reason: "No entrepreneur ad was available.",
+        },
     synced_assets: Object.fromEntries(
       Object.entries(syncedAssets).map(([id, asset]) => [
         id,
@@ -1576,9 +2651,10 @@ async function renderRecordingClipPlan(recordingId, proposedPlan) {
       crop_9_16: true,
       splice: true,
       text_overlays: true,
-      captions: true,
+      captions: false,
       meme_assets: true,
       sound_effects: true,
+      ad_insert: Boolean(adInsert?.inserted),
       zoom: renderPlan.sequence.clips.some((clip) => clip.effects?.zoom?.enabled),
       freeze_frame: false,
     },
@@ -1601,7 +2677,7 @@ async function runKeyboardAnalyzer(sessionId) {
   const sourceDir = sessionPath(sessionId, "original");
   const analysisPath = sessionPath(sessionId, "analysis.json");
   const stagePath = sessionPath(sessionId, "analysis-stage.json");
-  const scriptPath = resolve(rootDir, "tools", "analyze_game_controls_with_composio.py");
+  const scriptPath = resolve(rootDir, "tools", "analyze_game_controls_local.py");
   const commonArgs = [
     scriptPath,
     "--source",
@@ -1610,8 +2686,6 @@ async function runKeyboardAnalyzer(sessionId) {
     analysisPath,
     "--stage-out",
     stagePath,
-    "--model",
-    analyzerModel,
     "--max-files",
     analyzerMaxFiles,
     "--max-evidence",
@@ -1620,9 +2694,9 @@ async function runKeyboardAnalyzer(sessionId) {
     analyzerMaxContextLines,
   ];
 
-  await runCommand(pythonExecutable, commonArgs);
+  await runCommand(pythonExecutable, commonArgs, { env: pythonProcessEnv() });
 
-  return JSON.parse(await readFile(analysisPath, "utf-8"));
+  return readJsonFile(analysisPath);
 }
 
 async function runMappingPatcher(sessionId) {
@@ -1653,9 +2727,9 @@ async function runMappingPatcher(sessionId) {
   } catch {
   }
 
-  await runCommand(pythonExecutable, args);
+  await runCommand(pythonExecutable, args, { env: pythonProcessEnv() });
 
-  return JSON.parse(await readFile(reportPath, "utf-8"));
+  return readJsonFile(reportPath);
 }
 
 async function runPatchPlanner(sessionId) {
@@ -1675,9 +2749,9 @@ async function runPatchPlanner(sessionId) {
     mappingPath,
     "--json-out",
     planPath,
-  ]);
+  ], { env: pythonProcessEnv() });
 
-  return JSON.parse(await readFile(planPath, "utf-8"));
+  return readJsonFile(planPath);
 }
 
 async function markSessionFailed(sessionId, meta, error) {
@@ -1738,7 +2812,7 @@ async function processGithubSession(sessionId, meta, cloneUrl) {
       updated_at: new Date().toISOString(),
     });
 
-    await runCommand("git", ["clone", "--depth", "1", cloneUrl, originalDir], { cwd: rootDir });
+    await runCommand(resolveGitExecutable(), ["clone", "--depth", "1", cloneUrl, originalDir], { cwd: rootDir });
     await writeSessionMeta(sessionId, {
       ...meta,
       status: "cloned",
@@ -1887,12 +2961,806 @@ async function serveAssetFile(response, filename) {
   }
 }
 
+function normalizeVoiceSegments(payload) {
+  const segments = Array.isArray(payload?.segments) ? payload.segments : [];
+
+  if (!segments.length) {
+    const text = String(payload?.text ?? "").replace(/\s+/g, " ").trim();
+
+    if (!text) {
+      throw new Error("Voice script text is required.");
+    }
+
+    return [{ start: 0, end: 10, text }];
+  }
+
+  const normalizedSegments = segments
+    .map((segment, index) => {
+      const start = Math.max(0, Number(segment?.start ?? index * 2));
+      const end = Math.min(10, Math.max(start + 0.5, Number(segment?.end ?? start + 2)));
+      const text = String(segment?.text ?? "").replace(/\s+/g, " ").trim();
+
+      return { start, end, text };
+    })
+    .filter((segment) => segment.text)
+    .slice(0, 6);
+
+  const lastIndex = normalizedSegments.reduce((latestIndex, segment, index) => (
+    segment.end >= (normalizedSegments[latestIndex]?.end ?? 0) ? index : latestIndex
+  ), 0);
+
+  if (normalizedSegments[lastIndex]?.end < companyAdMinVoiceSeconds) {
+    normalizedSegments[lastIndex] = {
+      ...normalizedSegments[lastIndex],
+      end: companyAdMinVoiceSeconds,
+    };
+  }
+
+  return normalizedSegments;
+}
+
+async function synthesizeElevenLabsVoice(payload) {
+  if (!elevenLabsApiKey) {
+    throw new Error("Set ELEVENLABS_API_KEY before generating voice audio.");
+  }
+
+  const segments = normalizeVoiceSegments(payload);
+  const text = segments.map((segment) => segment.text).join(" ").replace(/\s+/g, " ").trim();
+
+  if (!text) {
+    throw new Error("Voice script text is required.");
+  }
+
+  if (text.length > 1000) {
+    throw new Error("Voice script is too long for a 10-second ad.");
+  }
+
+  const voiceId = String(payload?.voice_id ?? elevenLabsVoiceId).trim() || elevenLabsVoiceId;
+  const modelId = String(payload?.model_id ?? elevenLabsModelId).trim() || elevenLabsModelId;
+  const outputFormat = String(payload?.output_format ?? elevenLabsOutputFormat).trim() || elevenLabsOutputFormat;
+  const elevenLabsUrl = new URL(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`);
+  elevenLabsUrl.searchParams.set("output_format", outputFormat);
+
+  const elevenLabsResponse = await fetch(elevenLabsUrl, {
+    method: "POST",
+    headers: {
+      "Accept": "audio/mpeg",
+      "Content-Type": "application/json",
+      "xi-api-key": elevenLabsApiKey,
+    },
+    body: JSON.stringify({
+      text,
+      model_id: modelId,
+      voice_settings: {
+        stability: 0.48,
+        similarity_boost: 0.78,
+        style: 0.18,
+        use_speaker_boost: true,
+      },
+    }),
+  });
+
+  if (!elevenLabsResponse.ok) {
+    const errorText = await elevenLabsResponse.text();
+    throw new Error(errorText || `ElevenLabs voice generation failed with ${elevenLabsResponse.status}.`);
+  }
+
+  const audioBuffer = Buffer.from(await elevenLabsResponse.arrayBuffer());
+
+  return {
+    status: "ready",
+    provider: "elevenlabs",
+    voice_id: voiceId,
+    model_id: modelId,
+    output_format: outputFormat,
+    mime_type: "audio/mpeg",
+    text,
+    segments,
+    audio_base64: audioBuffer.toString("base64"),
+  };
+}
+
 async function readOptionalJson(path) {
   try {
-    return JSON.parse((await readFile(path, "utf-8")).replace(/^\uFEFF/, ""));
+    return readJsonFile(path);
   } catch {
     return null;
   }
+}
+
+async function readJsonFile(path) {
+  return JSON.parse((await readFile(path, "utf-8")).replace(/^\uFEFF/, ""));
+}
+
+const companyAdPalettes = [
+  {
+    name: "Signal Pop",
+    colors: ["#101827", "#5de6ff", "#ffd65a", "#ff5f9f"],
+    accent: "high-contrast cyan, warm yellow, sharp pink",
+  },
+  {
+    name: "Fresh Utility",
+    colors: ["#10231e", "#92ff73", "#5de6ff", "#f6f1df"],
+    accent: "fresh green, clean cyan, soft cream",
+  },
+  {
+    name: "Premium Pulse",
+    colors: ["#160f24", "#ff5f9f", "#ffd65a", "#f6f1df"],
+    accent: "deep violet, vivid pink, premium gold",
+  },
+  {
+    name: "Calm Tech",
+    colors: ["#0d1830", "#5de6ff", "#92ff73", "#aeb7c2"],
+    accent: "electric blue, health green, cool gray",
+  },
+];
+
+function titleCaseWords(text) {
+  return String(text ?? "")
+    .toLowerCase()
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function compactIdeaTitle(productIdea) {
+  const trimmed = String(productIdea ?? "").trim();
+
+  if (!trimmed) {
+    return "Launch Concept";
+  }
+
+  const words = trimmed.split(/\s+/).filter(Boolean);
+
+  if (words.length > 1) {
+    return titleCaseWords(words.slice(0, 4).join(" "));
+  }
+
+  return trimmed.length > 16 ? `${trimmed.slice(0, 16)}...` : titleCaseWords(trimmed);
+}
+
+function pickCompanyPalette(companyName, productIdea) {
+  const seedText = `${companyName} ${productIdea}`;
+  const seed = Array.from(seedText).reduce((total, character) => total + character.charCodeAt(0), 0);
+
+  return companyAdPalettes[seed % companyAdPalettes.length];
+}
+
+const backboardCompanyAdsSystemPrompt = [
+  "You are GestureForge's company-side product ad generation assistant.",
+  "Given a company name, product idea, and optional RAG context, generate product DNA, visual direction, image prompts, timed 7-10 second voice scripts, and final vertical video prompts.",
+  "Return compact valid JSON whenever json_output is requested.",
+  "Respect retrieved documents, remembered brand facts, and user revisions, but keep final voiceover between 7 and 10 seconds.",
+].join(" ");
+
+async function readBackboardState() {
+  const state = await readOptionalJson(backboardStatePath);
+  return state && typeof state === "object" ? state : {};
+}
+
+async function saveBackboardState(patch) {
+  if (!patch || typeof patch !== "object") {
+    return;
+  }
+
+  const currentState = await readBackboardState();
+  await mkdir(resolve(rootDir, "tmp"), { recursive: true });
+  await writeFile(backboardStatePath, JSON.stringify({ ...currentState, ...patch }, null, 2), "utf-8");
+}
+
+async function parseBackboardResponse(response) {
+  const responseText = await response.text();
+
+  try {
+    return JSON.parse(responseText || "{}");
+  } catch {
+    return { error: responseText };
+  }
+}
+
+function backboardJsonHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "X-API-Key": backboardApiKey,
+  };
+}
+
+function backboardErrorMessage(payload, fallback) {
+  if (!payload || typeof payload !== "object") {
+    return fallback;
+  }
+
+  if (typeof payload.error === "string") {
+    return sanitizeProviderError(payload.error);
+  }
+
+  if (payload.error && typeof payload.error === "object") {
+    return sanitizeProviderError(payload.error.message || payload.error.error || JSON.stringify(payload.error));
+  }
+
+  if (typeof payload.detail === "string") {
+    return sanitizeProviderError(payload.detail);
+  }
+
+  if (Array.isArray(payload.detail)) {
+    return sanitizeProviderError(JSON.stringify(payload.detail));
+  }
+
+  return fallback;
+}
+
+async function createBackboardAssistant() {
+  if (!backboardApiKey) {
+    throw new Error("Set BACKBOARD_API_KEY before generating ad assets.");
+  }
+
+  const response = await fetch(`${backboardApiBase}/assistants`, {
+    method: "POST",
+    headers: backboardJsonHeaders(),
+    body: JSON.stringify({
+      name: backboardAssistantName || "GestureForge Company Ads",
+      system_prompt: backboardCompanyAdsSystemPrompt,
+      tok_k: backboardAssistantTokK,
+      custom_fact_extraction_prompt: "Extract durable brand DNA, audience, product claims, visual language, and campaign preferences from company ad conversations.",
+      custom_update_memory_prompt: "Update memory only for stable company brand facts, approved product DNA, reusable visual language, and explicit user preferences.",
+    }),
+  });
+  const payload = await parseBackboardResponse(response);
+
+  if (!response.ok) {
+    throw new Error(`Backboard assistant creation failed: ${backboardErrorMessage(payload, `HTTP ${response.status}`)}`);
+  }
+
+  const assistantId = String(payload.assistant_id ?? "").trim();
+
+  if (!assistantId) {
+    throw new Error("Backboard assistant creation did not return assistant_id.");
+  }
+
+  await saveBackboardState({
+    assistant_id: assistantId,
+    assistant_name: payload.name || backboardAssistantName,
+    assistant_created_at: payload.created_at || new Date().toISOString(),
+  });
+
+  return assistantId;
+}
+
+async function getBackboardAssistant(assistantId) {
+  const response = await fetch(`${backboardApiBase}/assistants/${encodeURIComponent(assistantId)}`, {
+    method: "GET",
+    headers: {
+      "X-API-Key": backboardApiKey,
+    },
+  });
+  const payload = await parseBackboardResponse(response);
+
+  if (response.ok) {
+    return payload;
+  }
+
+  const message = backboardErrorMessage(payload, `HTTP ${response.status}`);
+
+  if (response.status === 404 || /not found/i.test(message)) {
+    return null;
+  }
+
+  throw new Error(`Backboard assistant lookup failed: ${message}`);
+}
+
+async function ensureBackboardAssistantId(overrideAssistantId = "") {
+  const explicitAssistantId = String(overrideAssistantId || configuredBackboardAssistantId).trim();
+
+  if (explicitAssistantId) {
+    const assistant = await getBackboardAssistant(explicitAssistantId);
+
+    if (!assistant) {
+      if (overrideAssistantId || configuredBackboardAssistantId) {
+        throw new Error("Configured Backboard assistant_id was not found.");
+      }
+
+      return createBackboardAssistant();
+    }
+
+    return explicitAssistantId;
+  }
+
+  const state = await readBackboardState();
+  const stateAssistantId = String(state?.assistant_id ?? "").trim();
+
+  if (stateAssistantId) {
+    const assistant = await getBackboardAssistant(stateAssistantId);
+
+    if (!assistant) {
+      await saveBackboardState({ assistant_id: "", stale_assistant_id: stateAssistantId });
+      return createBackboardAssistant();
+    }
+
+    return stateAssistantId;
+  }
+
+  return createBackboardAssistant();
+}
+
+async function createBackboardThread(assistantId) {
+  const response = await fetch(`${backboardApiBase}/assistants/${encodeURIComponent(assistantId)}/threads`, {
+    method: "POST",
+    headers: {
+      "X-API-Key": backboardApiKey,
+    },
+  });
+  const payload = await parseBackboardResponse(response);
+
+  if (!response.ok) {
+    throw new Error(`Backboard thread creation failed: ${backboardErrorMessage(payload, `HTTP ${response.status}`)}`);
+  }
+
+  const threadId = String(payload.thread_id ?? "").trim();
+
+  if (!threadId) {
+    throw new Error("Backboard thread creation did not return thread_id.");
+  }
+
+  return {
+    thread_id: threadId,
+    created_at: payload.created_at,
+  };
+}
+
+function backboardRagDocumentName(companyName) {
+  const cleanName = String(companyName || "company")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "company";
+
+  return `${cleanName}-rag-context.md`;
+}
+
+function backboardRagMessageAttachment({ companyName, productIdea, ragContext }) {
+  const context = String(ragContext ?? "").trim();
+
+  if (!context) {
+    return null;
+  }
+
+  return {
+    filename: backboardRagDocumentName(companyName),
+    mime_type: "text/markdown",
+    content: [
+      `# RAG Context for ${companyName || "Company"}`,
+      "",
+      `Product idea: ${productIdea || "(not provided)"}`,
+      "",
+      "## Source Notes",
+      context,
+    ].join("\n"),
+  };
+}
+
+function repairLooseJsonObject(text) {
+  return String(text ?? "")
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(/([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)/g, '$1"$2"$3')
+    .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_match, value) => JSON.stringify(value.replace(/\\'/g, "'")));
+}
+
+function sanitizeProviderError(text) {
+  return String(text ?? "")
+    .replace(/sk-[A-Za-z0-9_*.-]+/g, "[redacted_api_key]")
+    .replace(/key provided:\s*[^.\s]+/gi, "key provided: [redacted]");
+}
+
+function backboardContentError(parsed, label) {
+  if (!parsed?.error) {
+    return "";
+  }
+
+  const error = parsed.error;
+  const message = typeof error === "object" && error
+    ? error.message || error.error || JSON.stringify(error)
+    : String(error);
+
+  return `${label} failed: ${sanitizeProviderError(message)}`;
+}
+
+function providerErrorHint(text) {
+  const lowerText = String(text ?? "").toLowerCase();
+
+  if (lowerText.includes("incorrect api key")) {
+    return "provider API key is invalid or rejected.";
+  }
+
+  if (lowerText.includes("api key") && (lowerText.includes("missing") || lowerText.includes("not provided") || lowerText.includes("required"))) {
+    return "provider API key is missing.";
+  }
+
+  if (lowerText.includes("authentication") || lowerText.includes("unauthorized")) {
+    return "provider authentication failed.";
+  }
+
+  return "";
+}
+
+function normalizedBackboardMemoryMode(mode) {
+  const value = String(mode ?? "").trim();
+
+  if (["Auto", "Readonly", "off"].includes(value)) {
+    return value;
+  }
+
+  return "off";
+}
+
+function normalizedBackboardMemoryProMode(mode) {
+  const value = String(mode ?? "").trim();
+
+  if (["Auto", "Readonly"].includes(value)) {
+    return value;
+  }
+
+  return "";
+}
+
+function backboardMemoryRequestFields({ memory, memoryPro }) {
+  const memoryProMode = normalizedBackboardMemoryProMode(memoryPro);
+
+  if (memoryProMode) {
+    return { memory_pro: memoryProMode };
+  }
+
+  return { memory: normalizedBackboardMemoryMode(memory) };
+}
+
+function jsonObjectFromModelText(value, label = "Backboard") {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+
+  const cleaned = String(value ?? "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error(`${label} did not return a JSON object.`);
+  }
+
+  const objectText = cleaned.slice(start, end + 1);
+
+  try {
+    return JSON.parse(objectText);
+  } catch (error) {
+    try {
+      return JSON.parse(repairLooseJsonObject(objectText));
+    } catch {
+      const providerHint = providerErrorHint(objectText);
+
+      if (providerHint) {
+        throw new Error(`${label} failed: ${providerHint}`);
+      }
+
+      throw new Error(`${label} returned JSON that could not be parsed. ${error.message}.`);
+    }
+  }
+}
+
+async function sendBackboardMessage({
+  content,
+  jsonOutput = true,
+  memory = backboardAdMemoryMode,
+  memoryPro = backboardAdMemoryProMode,
+  systemPrompt = "",
+  assistantId = "",
+  threadId = "",
+  attachments = [],
+}) {
+  if (!backboardApiKey) {
+    throw new Error("Set BACKBOARD_API_KEY before generating ad assets.");
+  }
+
+  const resolvedAssistantId = await ensureBackboardAssistantId(assistantId);
+  const hasThread = Boolean(threadId);
+  const messageUrl = hasThread
+    ? `${backboardApiBase}/threads/${encodeURIComponent(threadId)}/messages`
+    : `${backboardApiBase}/threads/messages`;
+  const fields = {
+    content,
+    stream: false,
+    ...(backboardLlmProvider ? { llm_provider: backboardLlmProvider } : {}),
+    ...(backboardModelName ? { model_name: backboardModelName } : {}),
+    json_output: jsonOutput,
+    ...backboardMemoryRequestFields({ memory, memoryPro }),
+    send_to_llm: "true",
+    web_search: "off",
+    ...(!hasThread && resolvedAssistantId ? { assistant_id: resolvedAssistantId } : {}),
+    ...(!hasThread && systemPrompt ? { system_prompt: systemPrompt } : {}),
+  };
+  const cleanAttachments = (Array.isArray(attachments) ? attachments : [])
+    .filter((attachment) => attachment?.content && attachment?.filename);
+  const response = cleanAttachments.length
+    ? await fetch(messageUrl, {
+        method: "POST",
+        headers: {
+          "X-API-Key": backboardApiKey,
+        },
+        body: (() => {
+          const formData = new FormData();
+
+          Object.entries(fields).forEach(([key, value]) => {
+            if (value !== undefined && value !== null && value !== "") {
+              formData.append(key, typeof value === "boolean" ? String(value) : String(value));
+            }
+          });
+          cleanAttachments.forEach((attachment) => {
+            formData.append(
+              "files",
+              new Blob([attachment.content], { type: attachment.mime_type || "text/markdown" }),
+              attachment.filename,
+            );
+          });
+
+          return formData;
+        })(),
+      })
+    : await fetch(messageUrl, {
+        method: "POST",
+        headers: backboardJsonHeaders(),
+        body: JSON.stringify(fields),
+      });
+  const payload = await parseBackboardResponse(response);
+
+  if (!response.ok) {
+    throw new Error(`Backboard message failed: ${backboardErrorMessage(payload, `HTTP ${response.status}`)}`);
+  }
+
+  if (payload.assistant_id) {
+    await saveBackboardState({
+      assistant_id: String(payload.assistant_id),
+      last_thread_id: payload.thread_id ? String(payload.thread_id) : undefined,
+    });
+  }
+
+  return payload;
+}
+
+function normalizeAdPlan(rawPlan, originalPayload) {
+  const companyName = String(originalPayload?.company_name ?? originalPayload?.companyName ?? "").trim();
+  const productIdea = String(originalPayload?.product_idea ?? originalPayload?.productIdea ?? "").trim();
+  const ragContext = String(originalPayload?.rag_context ?? originalPayload?.ragContext ?? "").trim();
+  const plan = rawPlan && typeof rawPlan === "object" ? rawPlan : {};
+  const brandName = String(plan.brandName ?? plan.brand_name ?? companyName).trim() || "Company";
+  const productName = String(plan.productName ?? plan.product_name ?? compactIdeaTitle(productIdea)).trim() || "Product";
+  const palette = pickCompanyPalette(brandName, productIdea);
+  const rawSegments = Array.isArray(plan.script?.segments) ? plan.script.segments : [];
+  const segments = rawSegments
+    .map((segment, index) => ({
+      start: Math.max(0, Number(segment.start ?? index * 2)),
+      end: Math.min(10, Math.max(Number(segment.start ?? index * 2) + 0.5, Number(segment.end ?? index * 2 + 2))),
+      text: String(segment.text ?? "").replace(/\s+/g, " ").trim(),
+    }))
+    .filter((segment) => segment.text)
+    .slice(0, 5);
+  const safeSegments = segments.length
+    ? segments
+    : [
+        { start: 0, end: 2, text: `Meet ${productName}, built for the moment you need momentum.` },
+        { start: 2, end: 5, text: `${brandName} makes the core benefit simple, visible, and easy to trust.` },
+        { start: 5, end: 8, text: "See the product work in seconds, then feel the difference all day." },
+        { start: 8, end: 10, text: "Try it today and make the next move easier." },
+      ];
+
+  const lastSegmentIndex = safeSegments.reduce((latestIndex, segment, index) => (
+    segment.end >= (safeSegments[latestIndex]?.end ?? 0) ? index : latestIndex
+  ), 0);
+
+  if (safeSegments[lastSegmentIndex]?.end < companyAdMinVoiceSeconds) {
+    safeSegments[lastSegmentIndex] = {
+      ...safeSegments[lastSegmentIndex],
+      end: companyAdMinVoiceSeconds,
+    };
+  }
+
+  return {
+    brandName,
+    productName,
+    idea: String(plan.idea ?? productIdea).trim(),
+    ragContext,
+    palette,
+    dna: {
+      positioning: String(plan.dna?.positioning ?? "").trim(),
+      audience: String(plan.dna?.audience ?? "").trim(),
+      visualLanguage: String(plan.dna?.visualLanguage ?? plan.dna?.visual_language ?? "").trim(),
+      proofPoint: String(plan.dna?.proofPoint ?? plan.dna?.proof_point ?? "").trim(),
+      strategy: String(plan.dna?.strategy ?? "").trim(),
+    },
+    image: {
+      prompt: String(plan.image?.prompt ?? "").trim(),
+      negativePrompt: String(plan.image?.negativePrompt ?? plan.image?.negative_prompt ?? "").trim(),
+      image_url: String(plan.image?.image_url ?? plan.image?.url ?? "").trim(),
+      status: String(plan.image?.status ?? "Generated by Backboard").trim(),
+    },
+    script: {
+      segments: safeSegments,
+      note: String(plan.script?.note ?? "Keep the final voiceover between 7 and 10 seconds.").trim(),
+      timing: String(plan.script?.timing ?? "0-2s hook, 2-7s benefit proof, 7-10s CTA.").trim(),
+      audio_status: "idle",
+      audio_url: "",
+      audio_error: "",
+    },
+    video: {
+      prompt: String(plan.video?.prompt ?? "").trim(),
+      storyboard: String(plan.video?.storyboard ?? "").trim(),
+      status: String(plan.video?.status ?? "Ready to send to Backboard video generation").trim(),
+      video_url: String(plan.video?.video_url ?? plan.video?.url ?? "").trim(),
+    },
+    rag: {
+      sources: String(plan.rag?.sources ?? ragContext ?? "").trim(),
+      revisionInstruction: String(plan.rag?.revisionInstruction ?? plan.rag?.revision_instruction ?? "").trim(),
+    },
+    backboard: plan.backboard && typeof plan.backboard === "object" ? plan.backboard : {},
+  };
+}
+
+function backboardResponseMeta(response) {
+  return {
+    assistant_id: response.assistant_id,
+    thread_id: response.thread_id,
+    message_id: response.message_id,
+    run_id: response.run_id,
+    status: response.status,
+    memory_mode: normalizedBackboardMemoryMode(backboardAdMemoryMode),
+    memory_pro_mode: normalizedBackboardMemoryProMode(backboardAdMemoryProMode) || undefined,
+    memory_operation_id: response.memory_operation_id,
+    model_provider: response.model_provider,
+    model_name: response.model_name,
+    retrieved_memories: response.retrieved_memories,
+    retrieved_files: response.retrieved_files,
+    retrieved_files_count: response.retrieved_files_count,
+    attachments: response.attachments,
+    context_usage: response.context_usage,
+  };
+}
+
+async function generateAdPlanWithBackboard(payload) {
+  const companyName = String(payload?.company_name ?? payload?.companyName ?? "").trim();
+  const productIdea = String(payload?.product_idea ?? payload?.productIdea ?? "").trim();
+  const ragContext = String(payload?.rag_context ?? payload?.ragContext ?? "").trim();
+
+  if (!companyName) {
+    throw new Error("company_name is required.");
+  }
+
+  if (!productIdea) {
+    throw new Error("product_idea is required.");
+  }
+
+  const assistantId = await ensureBackboardAssistantId();
+  const ragAttachment = backboardRagMessageAttachment({ companyName, productIdea, ragContext });
+  const thread = ragAttachment ? await createBackboardThread(assistantId) : null;
+
+  const content = [
+    "Generate a complete product ad asset plan using Backboard.",
+    "All creative content must be generated by AI, grounded in the supplied product idea and any attached RAG document context.",
+    "If your Backboard assistant has image-generation tools, generate or request a product ad image and return image.image_url. If not, return a production-ready image.prompt and image.status explaining the image is ready for generation.",
+    "Voice script must run at least 7 seconds and at most 10 seconds, with roughly 22-30 spoken English words, returned as timed segments only.",
+    "Return JSON only with this exact shape:",
+    JSON.stringify({
+      brandName: "Company name",
+      productName: "Short product name",
+      idea: "Original product idea",
+      dna: {
+        positioning: "Product DNA positioning",
+        audience: "Target audience",
+        visualLanguage: "Visual language",
+        proofPoint: "Grounded proof point",
+        strategy: "Strategic focus",
+      },
+      image: {
+        prompt: "Image generation prompt",
+        negativePrompt: "Negative prompt",
+        image_url: "",
+        status: "Generated by Backboard or ready for image generation",
+      },
+      script: {
+        segments: [
+          { start: 0, end: 2, text: "Hook line spoken from 0 to 2 seconds." },
+          { start: 2, end: 5, text: "Benefit line spoken from 2 to 5 seconds." },
+          { start: 5, end: 8, text: "Proof line spoken from 5 to 8 seconds." },
+          { start: 8, end: 10, text: "CTA line spoken from 8 to 10 seconds." },
+        ],
+        note: "Between 7 and 10 seconds, about 22-30 spoken words.",
+        timing: "Timing rationale.",
+      },
+      video: {
+        prompt: "Video generation prompt",
+        storyboard: "0-2s / 2-5s / 5-8s / 8-10s storyboard",
+        status: "Ready to generate video",
+        video_url: "",
+      },
+      rag: {
+        sources: "RAG notes used",
+        revisionInstruction: "How future edits should preserve DNA and timing",
+      },
+    }),
+    "",
+    `Company name: ${companyName}`,
+    `Product idea: ${productIdea}`,
+    ragAttachment ? `RAG attachment: ${ragAttachment.filename}` : "RAG attachment: (none)",
+  ].join("\n");
+  const response = await sendBackboardMessage({
+    content,
+    jsonOutput: !ragAttachment,
+    memory: backboardAdMemoryMode,
+    memoryPro: backboardAdMemoryProMode,
+    assistantId,
+    threadId: thread?.thread_id,
+    attachments: ragAttachment ? [ragAttachment] : [],
+    systemPrompt: "You are a brand strategist and product ad generator. Return compact valid JSON only.",
+  });
+  const parsedPlan = jsonObjectFromModelText(response.content ?? response.message ?? response.text ?? response.output, "Backboard ad plan");
+  const contentError = backboardContentError(parsedPlan, "Backboard ad plan");
+
+  if (contentError) {
+    throw new Error(contentError);
+  }
+
+  const rawPlan = parsedPlan.plan && typeof parsedPlan.plan === "object" ? parsedPlan.plan : parsedPlan;
+
+  const backboard = backboardResponseMeta(response);
+  backboard.rag_document = ragAttachment ? { filename: ragAttachment.filename, source: "message_attachment" } : null;
+  const plan = normalizeAdPlan(rawPlan, payload);
+
+  plan.backboard = backboard;
+
+  return { plan, backboard };
+}
+
+async function generateVideoWithBackboard(payload) {
+  const currentPlan = payload?.plan && typeof payload.plan === "object" ? payload.plan : {};
+  const currentBackboard = currentPlan.backboard && typeof currentPlan.backboard === "object"
+    ? currentPlan.backboard
+    : payload?.backboard && typeof payload.backboard === "object" ? payload.backboard : {};
+  const content = [
+    "Generate the final video ad layer from the approved product DNA, image plan, voice script, and RAG notes.",
+    "Use Backboard tools if available to create an actual 10-second vertical video. Return video_url if a video asset is produced.",
+    "Return JSON only with this shape:",
+    JSON.stringify({
+      prompt: "Final video generation prompt",
+      storyboard: "0-2s / 2-5s / 5-8s / 8-10s storyboard",
+      status: "Generated by Backboard or ready for generation",
+      video_url: "",
+    }),
+    "",
+    JSON.stringify(currentPlan, null, 2),
+  ].join("\n");
+  const response = await sendBackboardMessage({
+    content,
+    jsonOutput: true,
+    memory: backboardAdMemoryMode,
+    memoryPro: backboardAdMemoryProMode,
+    assistantId: currentBackboard.assistant_id,
+    threadId: currentBackboard.thread_id,
+    systemPrompt: "You generate concise vertical product ads. Return compact valid JSON only.",
+  });
+  const parsedVideo = jsonObjectFromModelText(response.content ?? response.message ?? response.text ?? response.output, "Backboard video plan");
+  const contentError = backboardContentError(parsedVideo, "Backboard video plan");
+
+  if (contentError) {
+    throw new Error(contentError);
+  }
+
+  const video = parsedVideo.video && typeof parsedVideo.video === "object" ? parsedVideo.video : parsedVideo;
+
+  return {
+    video: {
+      prompt: String(video.prompt ?? currentPlan.video?.prompt ?? "").trim(),
+      storyboard: String(video.storyboard ?? currentPlan.video?.storyboard ?? "").trim(),
+      status: String(video.status ?? "Generated by Backboard").trim(),
+      video_url: String(video.video_url ?? video.url ?? "").trim(),
+    },
+    backboard: backboardResponseMeta(response),
+  };
 }
 
 async function latestReadySession() {
@@ -2313,10 +4181,11 @@ async function handleRequest(request, response) {
     }
 
     if (request.method === "GET" && url.pathname === "/api/camera/health") {
+      const ready = await cameraHealth();
       jsonResponse(response, 200, {
-        status: (await cameraHealth()) ? "ready" : "stopped",
+        status: ready ? "ready" : "stopped",
         port: cameraPort,
-        error: cameraError || undefined,
+        error: ready ? undefined : cameraError || undefined,
       });
       return;
     }
@@ -2359,6 +4228,35 @@ async function handleRequest(request, response) {
     if (request.method === "POST" && url.pathname === "/api/auth/login") {
       const result = await loginUser(await readJsonBody(request));
       jsonResponse(response, result.status, result.payload);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/ads/generate") {
+      jsonResponse(response, 200, await generateAdPlanWithBackboard(await readJsonBody(request)));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/ads/video") {
+      jsonResponse(response, 200, await generateVideoWithBackboard(await readJsonBody(request)));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/ads/render-video") {
+      jsonResponse(response, 200, await renderCompanyAdWithCloudinary(await readJsonBody(request)));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/ads/voice") {
+      const voice = await synthesizeElevenLabsVoice(await readJsonBody(request));
+      jsonResponse(response, 200, {
+        ...voice,
+        audio_url: `data:${voice.mime_type};base64,${voice.audio_base64}`,
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/recordings/upload") {
+      jsonResponse(response, 201, await uploadRecordingFileToCloudinary(request));
       return;
     }
 
@@ -2522,7 +4420,7 @@ async function handleRequest(request, response) {
     const statusMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9-]+)$/i);
     if (request.method === "GET" && statusMatch) {
       const sessionId = statusMatch[1];
-      const meta = JSON.parse(await readFile(sessionPath(sessionId, "session.json"), "utf-8"));
+      const meta = await readJsonFile(sessionPath(sessionId, "session.json"));
       const analysisStage = await readOptionalJson(sessionPath(sessionId, "analysis-stage.json"));
       jsonResponse(response, 200, {
         ...meta,
@@ -2533,14 +4431,14 @@ async function handleRequest(request, response) {
 
     const analysisMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9-]+)\/analysis$/i);
     if (request.method === "GET" && analysisMatch) {
-      const meta = JSON.parse(await readFile(sessionPath(analysisMatch[1], "session.json"), "utf-8"));
+      const meta = await readJsonFile(sessionPath(analysisMatch[1], "session.json"));
 
       if (meta.status !== "ready") {
         jsonResponse(response, 409, meta);
         return;
       }
 
-      const analysis = JSON.parse(await readFile(sessionPath(analysisMatch[1], "analysis.json"), "utf-8"));
+      const analysis = await readJsonFile(sessionPath(analysisMatch[1], "analysis.json"));
       jsonResponse(response, 200, analysis);
       return;
     }
@@ -2556,7 +4454,7 @@ async function handleRequest(request, response) {
     const planMappingMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9-]+)\/plan-mapping$/i);
     if (request.method === "POST" && planMappingMatch) {
       const sessionId = planMappingMatch[1];
-      const meta = JSON.parse(await readFile(sessionPath(sessionId, "session.json"), "utf-8"));
+      const meta = await readJsonFile(sessionPath(sessionId, "session.json"));
       let plan;
       let status = "planned";
 
@@ -2596,7 +4494,7 @@ async function handleRequest(request, response) {
 
     const patchPlanMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9-]+)\/patch-plan$/i);
     if (request.method === "GET" && patchPlanMatch) {
-      const plan = JSON.parse(await readFile(sessionPath(patchPlanMatch[1], "patch-plan.json"), "utf-8"));
+      const plan = await readJsonFile(sessionPath(patchPlanMatch[1], "patch-plan.json"));
       jsonResponse(response, 200, plan);
       return;
     }
@@ -2604,7 +4502,7 @@ async function handleRequest(request, response) {
     const applyMappingMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9-]+)\/apply-mapping$/i);
     if (request.method === "POST" && applyMappingMatch) {
       const sessionId = applyMappingMatch[1];
-      const meta = JSON.parse(await readFile(sessionPath(sessionId, "session.json"), "utf-8"));
+      const meta = await readJsonFile(sessionPath(sessionId, "session.json"));
       let report;
       let status = "patched";
 
@@ -2642,7 +4540,7 @@ async function handleRequest(request, response) {
 
     const patchReportMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9-]+)\/patch-report$/i);
     if (request.method === "GET" && patchReportMatch) {
-      const report = JSON.parse(await readFile(sessionPath(patchReportMatch[1], "patch-report.json"), "utf-8"));
+      const report = await readJsonFile(sessionPath(patchReportMatch[1], "patch-report.json"));
       jsonResponse(response, 200, report);
       return;
     }
@@ -2661,6 +4559,7 @@ async function handleRequest(request, response) {
 
 await mkdir(sessionsDir, { recursive: true });
 await mkdir(recordingsDir, { recursive: true });
+await mkdir(companyAdsDir, { recursive: true });
 
 createServer(handleRequest).listen(defaultPort, () => {
   console.log(`GestureForge backend listening on http://localhost:${defaultPort}`);

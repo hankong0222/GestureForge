@@ -3,6 +3,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 const acceptedGameTypes = ".zip";
 const apiBaseUrl = "http://localhost:8787";
 const handCameraStreamUrl = `${apiBaseUrl}/api/camera/video`;
+const companyGumImageAsset = "Caffeinated Chewing Gum.png";
+const fakeGeneratedImageUrl = `${apiBaseUrl}/api/assets/${encodeURIComponent(companyGumImageAsset)}`;
+const companyAdVideoAsset = "Caffeinated Chewing Gum.mp4";
 const savedStateKey = "gestureforge.uiState.v1";
 const recordingMimeTypes = [
   "video/webm;codecs=vp9",
@@ -49,6 +52,35 @@ const emptyAnalysis = {
   controls: [],
   unresolved: [],
 };
+
+const companyPalettes = [
+  {
+    name: "Signal Pop",
+    colors: ["#101827", "#5de6ff", "#ffd65a", "#ff5f9f"],
+    accent: "high-contrast cyan, warm yellow, sharp pink",
+  },
+  {
+    name: "Fresh Utility",
+    colors: ["#10231e", "#92ff73", "#5de6ff", "#f6f1df"],
+    accent: "fresh green, clean cyan, soft cream",
+  },
+  {
+    name: "Premium Pulse",
+    colors: ["#160f24", "#ff5f9f", "#ffd65a", "#f6f1df"],
+    accent: "deep violet, vivid pink, premium gold",
+  },
+  {
+    name: "Calm Tech",
+    colors: ["#0d1830", "#5de6ff", "#92ff73", "#aeb7c2"],
+    accent: "electric blue, health green, cool gray",
+  },
+];
+
+const mockupFormats = [
+  { id: "box", label: "Box" },
+  { id: "bottle", label: "Bottle" },
+  { id: "pouch", label: "Pouch" },
+];
 
 function normalizeFingerCombo(fingers) {
   const selected = new Set(Array.isArray(fingers) ? fingers : []);
@@ -210,6 +242,7 @@ function clipPlanStatusLabel(status) {
   const labels = {
     idle: "IDLE",
     loading: "LOADING",
+    planning: "AI PLAN",
     planned: "PLANNED",
     stale: "STALE",
     failed: "FAILED",
@@ -223,12 +256,47 @@ function clipRenderStatusLabel(status) {
     idle: "IDLE",
     loading: "LOADING",
     rendering: "RENDERING",
+    syncing_assets: "ASSETS",
+    rendering_clips: "CLIPS",
+    preparing_ad: "AD SLOT",
+    splicing: "SPLICING",
     rendered: "READY",
     stale: "STALE",
     failed: "FAILED",
   };
 
   return labels[status] ?? "IDLE";
+}
+
+function isClipRenderActive(status) {
+  return ["rendering", "syncing_assets", "rendering_clips", "preparing_ad", "splicing"].includes(status);
+}
+
+function workflowState(done, active, failed) {
+  if (failed) {
+    return "failed";
+  }
+
+  if (done) {
+    return "done";
+  }
+
+  if (active) {
+    return "active";
+  }
+
+  return "waiting";
+}
+
+function workflowStateLabel(state) {
+  const labels = {
+    active: "RUNNING",
+    done: "DONE",
+    failed: "FAILED",
+    waiting: "WAITING",
+  };
+
+  return labels[state] ?? "WAITING";
 }
 
 function formatSeconds(seconds) {
@@ -248,6 +316,139 @@ function clipTitleText(clip) {
     || clip?.source_highlight?.title
     || clip?.id
     || "Funny Moment";
+}
+
+function clipPlanDetailItems(clip) {
+  const notes = clip?.edit_notes && typeof clip.edit_notes === "object" ? clip.edit_notes : {};
+  const assetRationale = notes.asset_rationale && typeof notes.asset_rationale === "object" ? notes.asset_rationale : {};
+  const items = [
+    ["Hook", notes.hook],
+    ["Setup", notes.setup],
+    ["Payoff", notes.payoff],
+    ["Why", notes.why_funny || clip?.source_highlight?.reason],
+    ["Timing", notes.timing_notes],
+    ["Visual", notes.visual_strategy],
+    ["Audio", notes.audio_strategy],
+    ["Meme", assetRationale.meme],
+    ["Sound", assetRationale.sound],
+    ["Tune", notes.manual_tune_hint],
+    ["Risk", notes.risk_notes],
+  ];
+
+  return items
+    .map(([label, value]) => [label, String(value ?? "").trim()])
+    .filter(([, value]) => value);
+}
+
+function roleLabel(role) {
+  const labels = {
+    entrepreneur: "Entrepreneur",
+    player: "Player",
+  };
+
+  return labels[role] ?? "Player";
+}
+
+function titleCaseWords(value) {
+  return String(value ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function compactIdeaTitle(productIdea) {
+  const trimmed = String(productIdea ?? "").trim();
+
+  if (!trimmed) {
+    return "Launch Concept";
+  }
+
+  const words = trimmed.split(/\s+/).filter(Boolean);
+
+  if (words.length > 1) {
+    return titleCaseWords(words.slice(0, 4).join(" "));
+  }
+
+  return trimmed.length > 16 ? `${trimmed.slice(0, 16)}...` : titleCaseWords(trimmed);
+}
+
+function pickCompanyPalette(companyName, productIdea) {
+  const seedText = `${companyName} ${productIdea}`;
+  const seed = Array.from(seedText).reduce((total, character) => total + character.charCodeAt(0), 0);
+
+  return companyPalettes[seed % companyPalettes.length];
+}
+
+function voiceScriptText(segments) {
+  return (Array.isArray(segments) ? segments : [])
+    .map((segment) => String(segment.text ?? "").trim())
+    .filter(Boolean)
+    .join(" ");
+}
+
+function buildCompanyAdPlan(companyName, productIdea, ragContext = "") {
+  const brandName = String(companyName ?? "").trim() || "Your Company";
+  const idea = String(productIdea ?? "").trim() || "a new product idea";
+  const productName = compactIdeaTitle(idea);
+  const palette = pickCompanyPalette(brandName, idea);
+  const context = String(ragContext ?? "").trim();
+  const lowerIdea = idea.toLowerCase();
+  const benefit = lowerIdea.includes("ai") || lowerIdea.includes("smart")
+    ? "turns complex decisions into one confident action"
+    : lowerIdea.includes("drink") || lowerIdea.includes("food") || lowerIdea.includes("health")
+      ? "makes daily routines feel healthier and easier to keep"
+      : "makes the first try feel useful, fast, and memorable";
+  const audience = lowerIdea.includes("student")
+    ? "students and early-career builders who need clear wins without extra setup"
+    : lowerIdea.includes("fitness") || lowerIdea.includes("health")
+      ? "health-focused buyers who want progress they can see and repeat"
+      : "busy modern customers who reward products that explain themselves quickly";
+
+  return {
+    brandName,
+    productName,
+    idea,
+    ragContext: context,
+    palette,
+    dna: {
+      positioning: `${brandName} launches ${productName} as a product that ${benefit}.`,
+      audience,
+      visualLanguage: `${palette.name}: ${palette.accent}. Large product silhouette, crisp labels, one memorable motion cue.`,
+      proofPoint: context
+        ? `Use the RAG notes as grounding: ${context.slice(0, 160)}${context.length > 160 ? "..." : ""}`
+        : "Show a concrete before-and-after moment within the first five seconds.",
+      strategy: "Lead with the product value, show one use moment, close on a single CTA.",
+    },
+    image: {
+      prompt: `Create a premium product ad image for ${brandName}'s ${productName}. Show the product clearly, use ${palette.accent}, include one clean benefit cue, cinematic lighting, mobile ad composition.`,
+      negativePrompt: "No clutter, no tiny unreadable text, no generic stock-photo people, no distorted logos.",
+      status: "Ready to send to Backboard image generation",
+    },
+    script: {
+      segments: [
+        { start: 0, end: 2, text: `Meet ${productName}, built for the moment you need momentum.` },
+        { start: 2, end: 5, text: `${brandName} makes the core benefit simple, visible, and easy to trust.` },
+        { start: 5, end: 8, text: benefit.charAt(0).toUpperCase() + benefit.slice(1) + ", with a result you can feel quickly." },
+        { start: 8, end: 10, text: `Try it today and make the next move easier.` },
+      ],
+      note: "Keep the final voiceover between 7 and 10 seconds, around 22-30 words.",
+      timing: "0-2s hook, 2-7s product proof, 7-10s CTA.",
+      audio_status: "idle",
+      audio_url: "",
+      audio_error: "",
+    },
+      video: {
+        prompt: `Generate a 10-second vertical product ad video for ${productName}. Start with a sharp product reveal, cut to one use moment, end with ${brandName} logo and CTA. Match the generated image style.`,
+        storyboard: "0-2s product reveal / 2-5s use moment / 5-8s benefit proof / 8-10s logo and CTA",
+        status: "Ready to send to Backboard video generation",
+    },
+    rag: {
+      sources: context || "No RAG source added yet.",
+      revisionInstruction: "Apply edits to the current stage while preserving the product DNA and 7-10 second voiceover length.",
+    },
+  };
 }
 
 function BrandMark() {
@@ -278,6 +479,8 @@ function RecordGlyph() {
 }
 
 function AuthGate({ onAuthenticate }) {
+  const emailInputRef = useRef(null);
+  const passwordInputRef = useRef(null);
   const [role, setRole] = useState("entrepreneur");
   const [mode, setMode] = useState("login");
   const [name, setName] = useState("");
@@ -288,6 +491,24 @@ function AuthGate({ onAuthenticate }) {
   const [authNotice, setAuthNotice] = useState("");
   const [authError, setAuthError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  useEffect(() => {
+    function clearLoginFields() {
+      setEmail("");
+      setPassword("");
+      if (emailInputRef.current) {
+        emailInputRef.current.value = "";
+      }
+      if (passwordInputRef.current) {
+        passwordInputRef.current.value = "";
+      }
+    }
+
+    clearLoginFields();
+    const autofillTimers = [50, 250, 1000].map((delay) => window.setTimeout(clearLoginFields, delay));
+
+    return () => autofillTimers.forEach((timer) => window.clearTimeout(timer));
+  }, []);
 
   async function submitAuth(event) {
     event.preventDefault();
@@ -323,8 +544,12 @@ function AuthGate({ onAuthenticate }) {
         throw new Error(payload.error || "Authentication failed.");
       }
 
+      setEmail("");
+      setPassword("");
+      setVerificationCode("");
       onAuthenticate({
         ...payload.user,
+        role: payload.user?.role ?? role,
         signedInAt: new Date().toISOString(),
       });
     } catch (error) {
@@ -344,7 +569,7 @@ function AuthGate({ onAuthenticate }) {
         <p className="eyebrow">Welcome</p>
         <h1 id="auth-title">{mode === "login" ? "LOGIN" : "SIGN UP"}</h1>
         <p className="intro">
-          Choose your workspace before forging keyboard controls into gestures.
+          Choose your workspace before starting.
         </p>
 
         <div className="role-switch" role="group" aria-label="Account type">
@@ -356,25 +581,46 @@ function AuthGate({ onAuthenticate }) {
           </button>
         </div>
 
-        <form className="auth-form" onSubmit={submitAuth}>
+        <form autoComplete="off" className="auth-form" onSubmit={submitAuth}>
           {mode === "signup" && (
             <label>
               <span>Name</span>
-              <input value={name} onChange={(event) => setName(event.target.value)} />
+              <input autoComplete="off" name="gestureforge-display-name" value={name} onChange={(event) => setName(event.target.value)} />
             </label>
           )}
           <label>
             <span>Email</span>
-            <input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} />
+            <input
+              ref={emailInputRef}
+              autoComplete="off"
+              data-1p-ignore="true"
+              data-lpignore="true"
+              name="gestureforge-workspace-email"
+              required
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+            />
           </label>
           <label>
             <span>Password</span>
-            <input required minLength={4} type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+            <input
+              ref={passwordInputRef}
+              autoComplete="new-password"
+              data-1p-ignore="true"
+              data-lpignore="true"
+              name="gestureforge-workspace-passcode"
+              required
+              minLength={4}
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
           </label>
           {mode === "signup" && needsVerification && (
             <label>
               <span>Verification Code</span>
-              <input required value={verificationCode} onChange={(event) => setVerificationCode(event.target.value)} />
+              <input autoComplete="one-time-code" required value={verificationCode} onChange={(event) => setVerificationCode(event.target.value)} />
             </label>
           )}
           {authNotice && <p className="auth-notice">{authNotice}</p>}
@@ -471,9 +717,9 @@ function RecordingControl({
             Rec
           </button>
         )}
-        {hasRecording && !isRecording ? (
+        {!isRecording ? (
           <button className="pixel-button secondary compact" type="button" onClick={onPreviewRecording}>
-            Preview
+            {hasRecording ? "Preview" : "Cuts"}
           </button>
         ) : null}
       </div>
@@ -1114,6 +1360,57 @@ function RecordingPreviewPanel({
   const plannedClips = editablePlan?.sequence?.clips ?? [];
   const memeAssets = (editablePlan?.asset_catalog ?? []).filter((asset) => asset.kind === "meme");
   const soundAssets = (editablePlan?.asset_catalog ?? []).filter((asset) => asset.kind === "sound");
+  const defaultAssets = [
+    { id: "meme_laugh", label: "Laugh Meme", kind: "meme" },
+    { id: "meme_embarrassed", label: "Embarrassed Meme", kind: "meme" },
+    { id: "sound_laugh", label: "Laugh Sound", kind: "sound" },
+    { id: "sound_wtf", label: "WTF Sound", kind: "sound" },
+  ];
+  const displayedAssets = editablePlan?.asset_catalog?.length ? editablePlan.asset_catalog : defaultAssets;
+  const adInsert = clipRender?.ad_insert;
+  const clipRenderActive = isClipRenderActive(clipRenderStatus);
+  const pipelineSteps = [
+    {
+      label: "Cloudinary Original",
+      value: cloudinaryStatusLabel(cloudinaryStatus),
+      state: workflowState(Boolean(cloudinaryAsset?.backend_recording_id), ["uploading", "registering"].includes(cloudinaryStatus), Boolean(cloudinaryError)),
+    },
+    {
+      label: "Whisper Transcript",
+      value: videoAnalysisStatus === "complete" || videoAnalysisStatus === "partial" ? `${transcriptSegments.length} SEGMENTS` : videoAnalysisStatusLabel(videoAnalysisStatus),
+      state: workflowState(Boolean(transcriptSegments.length), videoAnalysisStatus === "analyzing", Boolean(videoAnalysisError)),
+    },
+    {
+      label: "Audio Signals",
+      value: videoAnalysisStatus === "complete" || videoAnalysisStatus === "partial" ? `${audioEvents.length} EVENTS` : videoAnalysisStatusLabel(videoAnalysisStatus),
+      state: workflowState(videoAnalysisStatus === "complete" || videoAnalysisStatus === "partial", videoAnalysisStatus === "analyzing", Boolean(videoAnalysisError)),
+    },
+    {
+      label: "Backboard Highlights",
+      value: highlights.length ? `${highlights.length} MOMENTS` : videoAnalysisStatusLabel(videoAnalysisStatus),
+      state: workflowState(Boolean(highlights.length), videoAnalysisStatus === "analyzing", Boolean(videoAnalysisError)),
+    },
+    {
+      label: "Clip Plan",
+      value: plannedClips.length ? `${plannedClips.length} CLIPS` : clipPlanStatusLabel(clipPlanStatus),
+      state: workflowState(Boolean(plannedClips.length), ["loading", "planning", "stale"].includes(clipPlanStatus), Boolean(clipPlanError)),
+    },
+    {
+      label: "Manual Tune",
+      value: plannedClips.length ? "READY" : "LOCKED",
+      state: workflowState(Boolean(plannedClips.length), false, false),
+    },
+    {
+      label: "Ad Insert",
+      value: adInsert?.inserted ? "INSERTED" : plannedClips.length ? "FIXED SLOT" : "LOCKED",
+      state: workflowState(Boolean(adInsert?.inserted), clipRenderActive && !clipRender?.final_url, Boolean(clipRenderError)),
+    },
+    {
+      label: "Cloudinary MP4",
+      value: clipRenderStatusLabel(clipRenderStatus),
+      state: workflowState(Boolean(clipRender?.final_url), clipRenderActive, Boolean(clipRenderError)),
+    },
+  ];
 
   return (
     <section className="recording-preview-panel" aria-label="Recording preview">
@@ -1122,6 +1419,28 @@ function RecordingPreviewPanel({
       <p className="intro">
         Review the last captured play session, then jump back into display mode when you are ready.
       </p>
+
+      <div className="autocut-workflow-board" aria-label="Automatic video editing workflow">
+        <div className="board-title">
+          <span>Auto Cut Workflow</span>
+          <span className="mini-led">{clipRender?.final_url ? "MP4 READY" : plannedClips.length ? "PLAN READY" : videoAnalysisStatusLabel(videoAnalysisStatus)}</span>
+        </div>
+        <div className="autocut-workflow-grid">
+          {pipelineSteps.map((step) => (
+            <article className={`workflow-step is-${step.state}`} key={step.label}>
+              <span>{workflowStateLabel(step.state)}</span>
+              <strong>{step.label}</strong>
+              <kbd>{step.value}</kbd>
+            </article>
+          ))}
+        </div>
+        <div className="asset-scope-strip" aria-label="Allowed edit assets">
+          <span>LOCAL ASSETS ONLY</span>
+          {displayedAssets.map((asset) => (
+            <kbd key={asset.id}>{asset.label}</kbd>
+          ))}
+        </div>
+      </div>
 
       {recordedClip?.url ? (
         <div className="recording-preview-grid">
@@ -1268,81 +1587,98 @@ function RecordingPreviewPanel({
         {clipPlanError && <p className="recording-error">{clipPlanError}</p>}
         {editablePlan?.output && (
           <p className="patch-note">
-            {editablePlan.output.width}x{editablePlan.output.height} / {editablePlan.output.aspect_ratio} / {editablePlan.output.format}
+            {editablePlan.generator || "backboard.io"} / {editablePlan.output.width}x{editablePlan.output.height} / {editablePlan.output.aspect_ratio} / {editablePlan.output.format}
             {editablePlan.asset_policy?.allowed_asset_ids?.length ? ` / ${editablePlan.asset_policy.allowed_asset_ids.length} LOCAL ASSETS` : ""}
+            {editablePlan.output.captions === false ? " / NO SUBTITLES" : ""}
           </p>
         )}
+        {editablePlan?.sequence?.strategy && (
+          <p className="patch-note">{editablePlan.sequence.strategy}</p>
+        )}
         <div className="clip-plan-list">
-          {plannedClips.map((clip) => (
-            <article className="clip-plan-card" key={clip.id}>
-              <div className="clip-plan-head">
-                <strong>{clipTitleText(clip)}</strong>
-                <kbd>{formatSeconds(clip.trim?.start)} - {formatSeconds(clip.trim?.end)}</kbd>
-              </div>
-              <div className="clip-plan-grid">
-                <span>Trim {Number(clip.trim?.duration || 0).toFixed(1)}s</span>
-                <span>Crop {clip.crop?.aspect_ratio || "9:16"} {clip.crop?.width}x{clip.crop?.height}</span>
-                <span>Captions {clip.captions?.length || 0}</span>
-                <span>Audio {clip.audio_signals?.length || 0}</span>
-                <span>Zoom {clip.effects?.zoom?.enabled ? "on" : "off"}</span>
-                <span>Freeze {clip.effects?.freeze_frame?.enabled ? `${clip.effects.freeze_frame.duration}s` : "off"}</span>
-              </div>
-              <div className="clip-tune-grid">
-                <label>
-                  <span>Start</span>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.1"
-                    value={clip.trim?.start ?? 0}
-                    onChange={(event) => onClipTrimChange(clip.id, "start", event.target.value)}
-                  />
-                </label>
-                <label>
-                  <span>End</span>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.1"
-                    value={clip.trim?.end ?? 0}
-                    onChange={(event) => onClipTrimChange(clip.id, "end", event.target.value)}
-                  />
-                </label>
-                <label>
-                  <span>Meme</span>
-                  <select
-                    value={clip.selected_assets?.meme ?? ""}
-                    onChange={(event) => onClipAssetChange(clip.id, "meme", event.target.value)}
-                  >
-                    <option value="">None</option>
-                    {memeAssets.map((asset) => (
-                      <option key={asset.id} value={asset.id}>{asset.label}</option>
+          {plannedClips.map((clip) => {
+            const detailItems = clipPlanDetailItems(clip);
+
+            return (
+              <article className="clip-plan-card" key={clip.id}>
+                <div className="clip-plan-head">
+                  <strong>{clipTitleText(clip)}</strong>
+                  <kbd>{formatSeconds(clip.trim?.start)} - {formatSeconds(clip.trim?.end)}</kbd>
+                </div>
+                <div className="clip-plan-grid">
+                  <span>Trim {Number(clip.trim?.duration || 0).toFixed(1)}s</span>
+                  <span>Crop {clip.crop?.aspect_ratio || "9:16"} {clip.crop?.width}x{clip.crop?.height}</span>
+                  <span>Text {clip.overlays?.filter((overlay) => overlay?.type === "text").length || 0}</span>
+                  <span>Audio {clip.audio_signals?.length || 0}</span>
+                  <span>Zoom {clip.effects?.zoom?.enabled ? "on" : "off"}</span>
+                  <span>Subtitles off</span>
+                </div>
+                {detailItems.length > 0 && (
+                  <div className="clip-detail-list">
+                    {detailItems.slice(0, 8).map(([label, value]) => (
+                      <div className="clip-detail-row" key={`${clip.id}-${label}`}>
+                        <span>{label}</span>
+                        <p>{value}</p>
+                      </div>
                     ))}
-                  </select>
-                </label>
-                <label>
-                  <span>Sound</span>
-                  <select
-                    value={clip.selected_assets?.sound ?? ""}
-                    onChange={(event) => onClipAssetChange(clip.id, "sound", event.target.value)}
-                  >
-                    <option value="">None</option>
-                    {soundAssets.map((asset) => (
-                      <option key={asset.id} value={asset.id}>{asset.label}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="clip-title-field">
-                  <span>Text</span>
-                  <input
-                    value={clipTitleText(clip)}
-                    onChange={(event) => onClipTextChange(clip.id, event.target.value)}
-                  />
-                </label>
-              </div>
-              {clip.captions?.[0]?.text && <p>{clip.captions[0].text}</p>}
-            </article>
-          ))}
+                  </div>
+                )}
+                <div className="clip-tune-grid">
+                  <label>
+                    <span>Start</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.1"
+                      value={clip.trim?.start ?? 0}
+                      onChange={(event) => onClipTrimChange(clip.id, "start", event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>End</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.1"
+                      value={clip.trim?.end ?? 0}
+                      onChange={(event) => onClipTrimChange(clip.id, "end", event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>Meme</span>
+                    <select
+                      value={clip.selected_assets?.meme ?? ""}
+                      onChange={(event) => onClipAssetChange(clip.id, "meme", event.target.value)}
+                    >
+                      <option value="">None</option>
+                      {memeAssets.map((asset) => (
+                        <option key={asset.id} value={asset.id}>{asset.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Sound</span>
+                    <select
+                      value={clip.selected_assets?.sound ?? ""}
+                      onChange={(event) => onClipAssetChange(clip.id, "sound", event.target.value)}
+                    >
+                      <option value="">None</option>
+                      {soundAssets.map((asset) => (
+                        <option key={asset.id} value={asset.id}>{asset.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="clip-title-field">
+                    <span>Text</span>
+                    <input
+                      value={clipTitleText(clip)}
+                      onChange={(event) => onClipTextChange(clip.id, event.target.value)}
+                    />
+                  </label>
+                </div>
+              </article>
+            );
+          })}
           {!plannedClips.length && <p className="analysis-empty">Waiting for Backboard highlights to generate the edit plan.</p>}
         </div>
       </div>
@@ -1356,11 +1692,11 @@ function RecordingPreviewPanel({
         <div className="clip-render-actions">
           <button
             className="pixel-button"
-            disabled={!plannedClips.length || clipRenderStatus === "rendering" || !cloudinaryAsset?.backend_recording_id}
+            disabled={!plannedClips.length || clipRenderActive || !cloudinaryAsset?.backend_recording_id}
             type="button"
             onClick={onRenderClipPlan}
           >
-            {clipRenderStatus === "rendering" ? "Rendering" : "Render MP4"}
+            {clipRenderActive ? "Rendering" : "Render MP4"}
           </button>
           {clipRender?.download_url && (
             <a className="pixel-button secondary download-link" href={clipRender.download_url} download target="_blank" rel="noreferrer">
@@ -1371,6 +1707,25 @@ function RecordingPreviewPanel({
         {clipRender?.final_url && (
           <div className="rendered-video">
             <video src={clipRender.final_url} controls />
+          </div>
+        )}
+        {adInsert && (
+          <div className="ad-insert-summary" aria-label="Inserted advertisement">
+            <div className="play-map-row">
+              <span>Entrepreneur Ad</span>
+              <kbd>{adInsert.inserted ? adInsert.title || adInsert.ad_id || "Inserted" : "None"}</kbd>
+            </div>
+            {adInsert.inserted && (
+              <div className="play-map-row">
+                <span>Placement</span>
+                <kbd>After Clip 1</kbd>
+              </div>
+            )}
+            {adInsert.video_url && (
+              <a className="cloudinary-link" href={adInsert.video_url} target="_blank" rel="noreferrer">
+                Ad Source
+              </a>
+            )}
           </div>
         )}
         {clipRender?.final_public_id && (
@@ -1418,6 +1773,761 @@ function GesturePreview({ mappings, analysis }) {
         )}
       </div>
     </aside>
+  );
+}
+
+function FieldEditor({ label, value, onChange, rows = 4 }) {
+  return (
+    <label className="backboard-field">
+      <span>{label}</span>
+      <textarea rows={rows} value={value} onChange={(event) => onChange(event.target.value)} />
+    </label>
+  );
+}
+
+function VoiceScriptEditor({ plan, onGenerateVoice, onPlanChange }) {
+  const segments = Array.isArray(plan.script.segments) ? plan.script.segments : [];
+  const isGeneratingVoice = plan.script.audio_status === "loading";
+
+  return (
+    <div className="voice-script-workflow">
+      <div className="voice-script-head">
+        <span>Voice Script</span>
+        <small>7-10s</small>
+      </div>
+
+      <div className="voice-segment-list">
+        {segments.map((segment, index) => (
+          <div className="voice-segment-row" key={`${segment.start}-${segment.end}-${index}`}>
+            <label>
+              <span>Start</span>
+              <input
+                min="0"
+                max="10"
+                step="0.5"
+                type="number"
+                value={segment.start}
+                onChange={(event) => onPlanChange(["script", "segments", index, "start"], Number(event.target.value))}
+              />
+            </label>
+            <label>
+              <span>End</span>
+              <input
+                min="0.5"
+                max="10"
+                step="0.5"
+                type="number"
+                value={segment.end}
+                onChange={(event) => onPlanChange(["script", "segments", index, "end"], Number(event.target.value))}
+              />
+            </label>
+            <label className="voice-line-field">
+              <span>{Number(segment.start).toFixed(1)}-{Number(segment.end).toFixed(1)}s</span>
+              <textarea rows={2} value={segment.text} onChange={(event) => onPlanChange(["script", "segments", index, "text"], event.target.value)} />
+            </label>
+          </div>
+        ))}
+      </div>
+
+      <div className="voice-audio-card">
+        <div>
+          <span>ElevenLabs Voice</span>
+          <p>{plan.script.audio_status === "ready" ? "Human voice ready." : plan.script.audio_status === "failed" ? plan.script.audio_error : "Generate the current timed script as human voice."}</p>
+        </div>
+        <button className="pixel-button secondary" disabled={isGeneratingVoice} type="button" onClick={onGenerateVoice}>
+          {isGeneratingVoice ? "Generating" : "Generate Human Voice"}
+        </button>
+        {plan.script.audio_url && <audio controls src={plan.script.audio_url} />}
+      </div>
+    </div>
+  );
+}
+
+function BackboardStageShell({ eyebrow, title, children }) {
+  return (
+    <section className="company-stage-panel" aria-label={title}>
+      <div className="company-stage-header">
+        <p className="eyebrow">{eyebrow}</p>
+        <h2>{title}</h2>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function AssetWorkflowPanel({ plan, onGenerateImage, onGenerateVideo, onGenerateVoice, onPlanChange, isGeneratingVideo, videoError }) {
+  if (!plan) {
+    return (
+      <section className="company-stage-panel company-empty-panel asset-workflow-panel" aria-label="Idea workflow">
+        <div>
+          <p className="eyebrow">Workflow</p>
+          <h2>Drafts Appear Here</h2>
+          <p className="generated-empty-copy">Product DNA, image prompt, voice script, and RAG edits will appear after upload.</p>
+        </div>
+      </section>
+    );
+  }
+
+  const hasVoiceAudio = Boolean(plan.script?.audio_base64 || String(plan.script?.audio_url ?? "").startsWith("data:"));
+  const videoStatus = videoError || (!hasVoiceAudio ? "Generate human voice first, then combine it with the asset video." : plan.video.status || "Use the approved assets to open the video layer.");
+
+  return (
+    <section className="company-stage-panel asset-workflow-panel" aria-label="Idea workflow">
+      <div className="company-stage-header">
+        <p className="eyebrow">Workflow</p>
+        <h2>Backboard Drafts</h2>
+      </div>
+
+      <div className="generated-ad-layer">
+        <span>Same Layer</span>
+        <div className="backboard-editor-grid">
+          <FieldEditor label="Product DNA" rows={5} value={plan.dna.positioning} onChange={(value) => onPlanChange(["dna", "positioning"], value)} />
+          <FieldEditor label="Image Prompt" rows={5} value={plan.image.prompt} onChange={(value) => onPlanChange(["image", "prompt"], value)} />
+          <div className="workflow-image-card">
+            <span>Generated Image</span>
+            <div className="image-regenerate-layout">
+              <div className="generated-image-frame">
+                {plan.image.status === "loading" ? (
+                  <div className="fake-generation-loader" aria-label="Generating image">
+                    <i />
+                    <p>Generating image asset...</p>
+                  </div>
+                ) : plan.image.image_url ? (
+                  <img alt={`${plan.productName} generated product ad`} src={plan.image.image_url} />
+                ) : (
+                  <p>{plan.image.status || "Backboard will return an image asset or an image generation prompt here."}</p>
+                )}
+              </div>
+              <label className="image-prompt-dialog">
+                <span>Image Request</span>
+                <textarea
+                  rows={5}
+                  value={plan.image.regeneratePrompt ?? ""}
+                  placeholder="Ask for a new image direction"
+                  onChange={(event) => onPlanChange(["image", "regeneratePrompt"], event.target.value)}
+                />
+                <button className="pixel-button" disabled={plan.image.status === "loading"} type="button" onClick={onGenerateImage}>
+                  {plan.image.status === "loading" ? "Regenerating" : "Regenerate"}
+                </button>
+              </label>
+            </div>
+          </div>
+          <VoiceScriptEditor plan={plan} onGenerateVoice={onGenerateVoice} onPlanChange={onPlanChange} />
+          <FieldEditor label="RAG + Revisions" rows={4} value={plan.rag.revisionInstruction} onChange={(value) => onPlanChange(["rag", "revisionInstruction"], value)} />
+          <div className="video-generate-card">
+            <span>Video</span>
+            <p>{videoStatus}</p>
+            <button className="pixel-button" disabled={isGeneratingVideo || !hasVoiceAudio} type="button" onClick={onGenerateVideo}>
+              {isGeneratingVideo ? "Combining With Cloudinary" : "Generate Video"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function GeneratedAdsPanel({ plan, isGeneratingVideo, videoError, onPromptChange, onRegenerateVideo, onSubmitVideo }) {
+  if (!plan) {
+    return (
+      <section className="company-stage-panel company-empty-panel generated-ads-panel" aria-label="Generated ads">
+        <div>
+          <p className="eyebrow">Generated Ads</p>
+          <h2>No Video Yet</h2>
+          <p className="generated-empty-copy">Upload your idea first, then generate the final video from the approved assets.</p>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="generated-ads-panel video-only-panel" aria-label="Generated ads">
+      <div className="generated-video-main">
+        {isGeneratingVideo ? (
+          <div className="generated-video-preview fake-video-loading" aria-label="Generating video">
+            <div className="fake-generation-loader">
+              <i />
+              <p>Combining voice and asset video in Cloudinary...</p>
+            </div>
+          </div>
+        ) : plan.video.video_url ? (
+          <div className="generated-video-preview rendered-video-frame" aria-label="Generated Cloudinary video">
+            <video className="generated-video-player" controls playsInline src={plan.video.video_url} />
+          </div>
+        ) : (
+          <div className="generated-video-preview video-empty-frame" aria-label="Generated video placeholder">
+            <span>{plan.brandName}</span>
+            <strong>{plan.productName}</strong>
+            <p>{videoError || plan.video.status || "Video layer ready."}</p>
+          </div>
+        )}
+      </div>
+
+      <aside className="video-prompt-panel" aria-label="Video prompt controls">
+        <span>Video Prompt</span>
+        <textarea
+          rows={8}
+          value={plan.video.regeneratePrompt ?? ""}
+          placeholder="Ask for a different cut, mood, pacing, CTA, or product emphasis"
+          onChange={(event) => onPromptChange(event.target.value)}
+        />
+        <div className="video-prompt-actions">
+          <button className="pixel-button secondary" disabled={isGeneratingVideo} type="button" onClick={onRegenerateVideo}>
+            {isGeneratingVideo ? "Regenerating" : "Regenerate"}
+          </button>
+          <button className="pixel-button" disabled={isGeneratingVideo || !plan.video.video_url} type="button" onClick={onSubmitVideo}>
+            Submit
+          </button>
+        </div>
+        <p>{videoError || plan.video.status || "Ready for final review."}</p>
+      </aside>
+    </section>
+  );
+}
+
+function CompanyMockup({ plan, selectedFormat, onFormatChange }) {
+  const [spin, setSpin] = useState(-24);
+  const [tilt, setTilt] = useState(-8);
+  const [isDragging, setIsDragging] = useState(false);
+  const palette = plan?.palette ?? companyPalettes[0];
+  const colors = palette.colors;
+  const label = plan?.packaging?.frontCopy ?? "Product";
+  const brand = plan?.brandName ?? "Company";
+
+  function updateFromPointer(event) {
+    if (!isDragging) {
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = (event.clientX - rect.left) / rect.width;
+    const y = (event.clientY - rect.top) / rect.height;
+    setSpin(Math.round((x - 0.5) * 86));
+    setTilt(Math.round((0.5 - y) * 42));
+  }
+
+  return (
+    <aside className="mockup-board" aria-label="Packaging mockup">
+      <div className="board-title">
+        <span>3D Mockup</span>
+        <span className="mini-led">LIVE</span>
+      </div>
+      <div className="mockup-format-row" role="group" aria-label="Packaging format">
+        {mockupFormats.map((format) => (
+          <button
+            className={selectedFormat === format.id ? "is-active" : ""}
+            key={format.id}
+            type="button"
+            onClick={() => onFormatChange(format.id)}
+          >
+            {format.label}
+          </button>
+        ))}
+      </div>
+      <div
+        className="product-mockup-stage"
+        onPointerDown={(event) => {
+          setIsDragging(true);
+          event.currentTarget.setPointerCapture?.(event.pointerId);
+        }}
+        onPointerMove={updateFromPointer}
+        onPointerUp={() => setIsDragging(false)}
+        onPointerCancel={() => setIsDragging(false)}
+      >
+        <div
+          className={`mockup-object is-${selectedFormat}`}
+          style={{
+            "--mockup-spin": `${spin}deg`,
+            "--mockup-tilt": `${tilt}deg`,
+            "--mockup-base": colors[0],
+            "--mockup-accent": colors[1],
+            "--mockup-pop": colors[2],
+            "--mockup-mark": colors[3],
+          }}
+        >
+          <div className="mockup-face front">
+            <span>{brand}</span>
+            <strong>{label}</strong>
+            <small>{plan?.brief?.cta ?? "Launch Draft"}</small>
+          </div>
+          <div className="mockup-face back">
+            <span>{palette.name}</span>
+            <strong>{plan?.packaging?.shelfSignal ?? "Signal Benefit"}</strong>
+          </div>
+          <div className="mockup-face left" />
+          <div className="mockup-face right" />
+          <div className="mockup-face top" />
+          <div className="mockup-face bottom" />
+          {selectedFormat === "bottle" && <span className="mockup-cap" />}
+        </div>
+      </div>
+      <div className="mockup-control-grid">
+        <label>
+          <span>Spin</span>
+          <input type="range" min="-60" max="60" value={spin} onChange={(event) => setSpin(Number(event.target.value))} />
+        </label>
+        <label>
+          <span>Tilt</span>
+          <input type="range" min="-28" max="28" value={tilt} onChange={(event) => setTilt(Number(event.target.value))} />
+        </label>
+      </div>
+    </aside>
+  );
+}
+
+function BackboardPreview({ plan }) {
+  const palette = plan?.palette ?? companyPalettes[0];
+  const colors = palette.colors;
+  const productName = plan?.productName ?? "Product";
+  const brandName = plan?.brandName ?? "Company";
+
+  return (
+    <aside className="backboard-preview-board" aria-label="Backboard generated assets preview">
+      <div className="board-title">
+        <span>Backboard Outputs</span>
+        <span className="mini-led">RAG READY</span>
+      </div>
+
+      <div
+        className="generated-image-preview"
+        style={{
+          "--image-base": colors[0],
+          "--image-accent": colors[1],
+          "--image-pop": colors[2],
+          "--image-mark": colors[3],
+        }}
+      >
+        <div className="generated-product-card">
+          <span>{brandName}</span>
+          <strong>{productName}</strong>
+          <small>{plan?.dna?.strategy ?? "Generate Product DNA first"}</small>
+        </div>
+      </div>
+
+      <div className="backboard-output-stack">
+        <article>
+          <span>Image</span>
+          <p>{plan?.image?.status ?? "Waiting for product input."}</p>
+        </article>
+        <article>
+          <span>Voice Script</span>
+          <p>{plan?.script?.segments ? voiceScriptText(plan.script.segments) : "A short 10-second script will appear here."}</p>
+        </article>
+        <article>
+          <span>Video</span>
+          <p>{plan?.video?.status ?? "Video generation will use the approved DNA, image, and script."}</p>
+        </article>
+      </div>
+    </aside>
+  );
+}
+
+function EntrepreneurWorkspace({ authProfile, onLogout }) {
+  const fakeGenerationTimersRef = useRef([]);
+  const [companyName, setCompanyName] = useState("");
+  const [productIdea, setProductIdea] = useState("");
+  const [ragContext, setRagContext] = useState("");
+  const [companyPage, setCompanyPage] = useState("upload");
+  const [plan, setPlan] = useState(null);
+  const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
+  const [generationError, setGenerationError] = useState("");
+  const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
+  const [videoError, setVideoError] = useState("");
+  const [hasOpenedVideoLayer, setHasOpenedVideoLayer] = useState(false);
+  const canGenerate = companyName.trim() && productIdea.trim();
+
+  useEffect(() => () => {
+    fakeGenerationTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    fakeGenerationTimersRef.current = [];
+  }, []);
+
+  function queueFakeGeneration(callback, delay = 1400) {
+    const timer = window.setTimeout(() => {
+      fakeGenerationTimersRef.current = fakeGenerationTimersRef.current.filter((item) => item !== timer);
+      callback();
+    }, delay);
+
+    fakeGenerationTimersRef.current.push(timer);
+  }
+
+  function startFakeImageGeneration(basePlan, request = "") {
+    const imageRequest = String(request ?? "").trim();
+
+    setPlan({
+      ...basePlan,
+      image: {
+        ...basePlan.image,
+        image_url: "",
+        status: "loading",
+        regeneratePrompt: imageRequest || basePlan.image?.regeneratePrompt || "",
+      },
+    });
+
+    queueFakeGeneration(() => {
+      setPlan((currentPlan) => currentPlan
+        ? {
+            ...currentPlan,
+            image: {
+              ...currentPlan.image,
+              image_url: fakeGeneratedImageUrl,
+              status: imageRequest ? `Regenerated from local asset: ${imageRequest}` : "Generated from local asset",
+              provider: "local_fake_asset",
+            },
+          }
+        : currentPlan);
+    });
+  }
+
+  function regenerateImage() {
+    if (!plan || plan.image?.status === "loading") {
+      return;
+    }
+
+    startFakeImageGeneration(plan, plan.image?.regeneratePrompt);
+  }
+
+  async function generateDraft(event) {
+    event.preventDefault();
+
+    if (!canGenerate || isGeneratingPlan) {
+      return;
+    }
+
+    setIsGeneratingPlan(true);
+    setGenerationError("");
+    setVideoError("");
+    setHasOpenedVideoLayer(false);
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/ads/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          company_name: companyName.trim(),
+          product_idea: productIdea.trim(),
+          rag_context: ragContext.trim(),
+        }),
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Backboard generation failed.");
+      }
+
+      startFakeImageGeneration(payload.plan);
+      setCompanyPage("upload");
+    } catch (error) {
+      setGenerationError(error.message);
+    } finally {
+      setIsGeneratingPlan(false);
+    }
+  }
+
+  function updatePlanValue(path, value) {
+    setPlan((currentPlan) => {
+      if (!currentPlan) {
+        return currentPlan;
+      }
+
+      const nextPlan = structuredClone(currentPlan);
+      let target = nextPlan;
+
+      path.slice(0, -1).forEach((key) => {
+        target = target[key];
+      });
+      target[path.at(-1)] = value;
+
+      return nextPlan;
+    });
+  }
+
+  function patchScript(patch) {
+    setPlan((currentPlan) => {
+      if (!currentPlan) {
+        return currentPlan;
+      }
+
+      return {
+        ...currentPlan,
+        script: {
+          ...currentPlan.script,
+          ...patch,
+        },
+      };
+    });
+  }
+
+  async function generateHumanVoice() {
+    if (!plan?.script?.segments?.length) {
+      return;
+    }
+
+    setHasOpenedVideoLayer(false);
+    setVideoError("");
+    setPlan((currentPlan) => currentPlan
+      ? {
+          ...currentPlan,
+          script: {
+            ...currentPlan.script,
+            audio_status: "loading",
+            audio_error: "",
+            audio_url: "",
+            audio_base64: "",
+            mime_type: "",
+            provider: "",
+          },
+          video: {
+            ...currentPlan.video,
+            status: "Waiting for the new voice audio before Cloudinary render.",
+            video_url: "",
+            render: null,
+          },
+        }
+      : currentPlan);
+
+    const currentSegments = plan.script.segments;
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/ads/voice`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          segments: currentSegments,
+        }),
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "ElevenLabs voice generation failed.");
+      }
+
+      setPlan((currentPlan) => currentPlan
+        ? {
+            ...currentPlan,
+            script: {
+              ...currentPlan.script,
+              segments: payload.segments ?? currentPlan.script.segments,
+              audio_status: "ready",
+              audio_error: "",
+              audio_url: payload.audio_url,
+              audio_base64: payload.audio_base64,
+              mime_type: payload.mime_type,
+              provider: payload.provider,
+              voice_id: payload.voice_id,
+              audio_text: payload.text,
+            },
+            video: {
+              ...currentPlan.video,
+              status: "New voice ready. Generate Video will combine it with the local asset in Cloudinary.",
+              video_url: "",
+              render: null,
+            },
+          }
+        : currentPlan);
+    } catch (error) {
+      patchScript({
+        audio_status: "failed",
+        audio_error: error.message,
+        audio_url: "",
+        audio_base64: "",
+      });
+    }
+  }
+
+  async function generateVideo() {
+    if (!plan || isGeneratingVideo) {
+      return;
+    }
+
+    const audioBase64 = plan.script?.audio_base64 || (String(plan.script?.audio_url ?? "").startsWith("data:") ? String(plan.script.audio_url).split(",").at(-1) : "");
+
+    if (!audioBase64) {
+      setVideoError("Generate Human Voice first so Cloudinary can combine the latest audio with the asset video.");
+      return;
+    }
+
+    const requestPlan = {
+      ...plan,
+      script: {
+        ...plan.script,
+        audio_base64: audioBase64,
+      },
+    };
+
+    setIsGeneratingVideo(true);
+    setVideoError("");
+    setHasOpenedVideoLayer(true);
+    setCompanyPage("generated");
+    setPlan((currentPlan) => currentPlan
+      ? {
+          ...currentPlan,
+          video: {
+            ...currentPlan.video,
+            status: "Combining latest ElevenLabs audio with asset video in Cloudinary...",
+            video_url: "",
+            render: null,
+          },
+        }
+      : currentPlan);
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/ads/render-video`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan: requestPlan,
+          video_asset: companyAdVideoAsset,
+          video_prompt: requestPlan.video?.regeneratePrompt ?? "",
+          recipient_email: authProfile?.email,
+          recipient_name: authProfile?.name,
+        }),
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Cloudinary video render failed.");
+      }
+
+      setPlan((currentPlan) => currentPlan
+        ? {
+            ...currentPlan,
+            video: {
+              ...currentPlan.video,
+              status: payload.email_status === "sent"
+                ? "Cloudinary render ready. Email sent to the logged-in user."
+                : payload.email_status === "failed"
+                  ? "Cloudinary render ready. Email notification failed."
+                  : "Cloudinary render ready.",
+              video_url: payload.video_url,
+              provider: payload.provider,
+              source_asset: payload.source_video_asset,
+              regeneratePrompt: currentPlan.video.regeneratePrompt ?? "",
+              render: payload,
+            },
+          }
+        : currentPlan);
+    } catch (error) {
+      setVideoError(error.message);
+      setPlan((currentPlan) => currentPlan
+        ? {
+            ...currentPlan,
+            video: {
+              ...currentPlan.video,
+              status: "Cloudinary render failed.",
+              video_url: "",
+            },
+          }
+        : currentPlan);
+    } finally {
+      setIsGeneratingVideo(false);
+    }
+  }
+
+  function submitGeneratedVideo() {
+    if (!plan?.video?.video_url) {
+      return;
+    }
+
+    setPlan((currentPlan) => currentPlan
+      ? {
+          ...currentPlan,
+          video: {
+            ...currentPlan.video,
+            status: "Generated ad submitted.",
+            submitted_at: new Date().toISOString(),
+            submitted_prompt: currentPlan.video.regeneratePrompt ?? "",
+          },
+        }
+      : currentPlan);
+  }
+
+  return (
+    <main className="app-shell company-app">
+      <section className="screen company-screen" aria-labelledby="page-title">
+        <div className="top-bar">
+          <div className="brand">
+            <BrandMark />
+            <span>GestureForge</span>
+          </div>
+          <div className="status-chip">
+            <span className="status-light" aria-hidden="true" />
+            Company Workspace
+          </div>
+          <button className="auth-logout" type="button" onClick={onLogout}>
+            Logout
+          </button>
+        </div>
+
+        <nav className="company-page-tabs" aria-label="Company pages">
+          <button className={companyPage === "upload" ? "is-active" : ""} type="button" onClick={() => setCompanyPage("upload")}>
+            Upload Your Idea
+          </button>
+          <button
+            className={companyPage === "generated" ? "is-active" : ""}
+            disabled={!hasOpenedVideoLayer}
+            type="button"
+            onClick={() => setCompanyPage("generated")}
+          >
+            Generated Ads
+          </button>
+        </nav>
+
+        {companyPage === "upload" ? (
+          <div className="company-studio-grid">
+            <form className="company-input-panel company-upload-page" onSubmit={generateDraft}>
+              <p className="eyebrow">Backboard.io Workspace</p>
+              <h1 className="company-title" id="page-title">Upload Your Idea</h1>
+              <label htmlFor="company-name">
+                <span>Company Name</span>
+                <input id="company-name" value={companyName} onChange={(event) => setCompanyName(event.target.value)} />
+              </label>
+              <label htmlFor="product-idea">
+                <span>Product Idea</span>
+                <textarea
+                  id="product-idea"
+                  value={productIdea}
+                  placeholder="A refillable bottle that tracks hydration and mineral balance"
+                  onChange={(event) => setProductIdea(event.target.value)}
+                />
+              </label>
+              <label htmlFor="rag-context">
+                <span>RAG Context</span>
+                <textarea
+                  id="rag-context"
+                  value={ragContext}
+                  placeholder="Paste brand guidelines, target audience notes, competitor references, product claims, URLs, or internal docs summary"
+                  onChange={(event) => setRagContext(event.target.value)}
+                />
+              </label>
+              {generationError && <p className="auth-error">{generationError}</p>}
+              <button className="pixel-button" disabled={!canGenerate || isGeneratingPlan} type="submit">
+                {isGeneratingPlan ? "Generating With Backboard" : "Start Backboard Flow"}
+              </button>
+            </form>
+            <AssetWorkflowPanel
+              plan={plan}
+              isGeneratingVideo={isGeneratingVideo}
+              videoError={videoError}
+              onGenerateImage={regenerateImage}
+              onGenerateVideo={generateVideo}
+              onGenerateVoice={generateHumanVoice}
+              onPlanChange={updatePlanValue}
+            />
+          </div>
+        ) : (
+          <div className="generated-ads-page">
+            <GeneratedAdsPanel
+              plan={plan}
+              isGeneratingVideo={isGeneratingVideo}
+              videoError={videoError}
+              onPromptChange={(value) => updatePlanValue(["video", "regeneratePrompt"], value)}
+              onRegenerateVideo={generateVideo}
+              onSubmitVideo={submitGeneratedVideo}
+            />
+          </div>
+        )}
+      </section>
+    </main>
   );
 }
 
@@ -1828,6 +2938,43 @@ export default function App() {
     return payload;
   }
 
+  async function uploadRecordingThroughBackend(clip) {
+    const currentSession = sessionRef.current;
+    const response = await fetch(`${apiBaseUrl}/api/recordings/upload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": clip.blob.type || "video/webm",
+        "X-Recording-Duration-Ms": String(clip.durationMs || 0),
+        "X-Recording-Filename": encodeURIComponent(clip.name || "gestureforge-recording.webm"),
+        "X-Recording-Size": String(clip.size || clip.blob.size || 0),
+        "X-Session-Id": currentSession?.session_id ?? "",
+      },
+      body: clip.blob,
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error("Backend upload endpoint is not loaded yet. Restart the backend so Cloudinary signed upload can run.");
+      }
+
+      throw new Error(payload.error || "Backend Cloudinary upload failed.");
+    }
+
+    return {
+      bytes: payload.bytes,
+      duration: payload.duration,
+      format: payload.format,
+      height: payload.height,
+      public_id: payload.public_id,
+      resource_type: payload.resource_type,
+      type: payload.type,
+      video_url: payload.video_url,
+      width: payload.width,
+      backend_recording_id: payload.recording_id,
+    };
+  }
+
   async function pollVideoAnalysis(recordingId) {
     const startedAt = Date.now();
     setVideoAnalysisStatus("queued");
@@ -2084,12 +3231,6 @@ export default function App() {
   }
 
   async function uploadRecordingToCloudinary(clip) {
-    if (!cloudinaryCloudName || !cloudinaryUploadPreset) {
-      setCloudinaryStatus("unconfigured");
-      setCloudinaryError("Set VITE_CLOUDINARY_CLOUD_NAME and VITE_CLOUDINARY_UPLOAD_PRESET.");
-      return;
-    }
-
     setCloudinaryStatus("uploading");
     setCloudinaryError("");
     setCloudinaryAsset(null);
@@ -2097,6 +3238,14 @@ export default function App() {
     let uploadedAsset = null;
 
     try {
+      if (!cloudinaryCloudName || !cloudinaryUploadPreset) {
+        uploadedAsset = await uploadRecordingThroughBackend(clip);
+        setCloudinaryAsset(uploadedAsset);
+        setCloudinaryStatus("stored");
+        pollVideoAnalysis(uploadedAsset.backend_recording_id);
+        return;
+      }
+
       const formData = new FormData();
       formData.append("file", clip.blob, clip.name);
       formData.append("upload_preset", cloudinaryUploadPreset);
@@ -2366,7 +3515,7 @@ export default function App() {
     }
 
     if (step === 4) {
-      return Boolean(recordedClip?.url);
+      return true;
     }
 
     return false;
@@ -2473,21 +3622,21 @@ export default function App() {
     />
   );
 
-  if (currentStep === 3) {
-    if (!authProfile) {
-      return <AuthGate onAuthenticate={authenticate} />;
-    }
+  if (!authProfile) {
+    return <AuthGate onAuthenticate={authenticate} />;
+  }
 
+  if (authProfile.role !== "player") {
+    return <EntrepreneurWorkspace authProfile={authProfile} onLogout={logout} />;
+  }
+
+  if (currentStep === 3) {
     return (
       <>
         {renderStep()}
         {recordingOverlay}
       </>
     );
-  }
-
-  if (!authProfile) {
-    return <AuthGate onAuthenticate={authenticate} />;
   }
 
   return (
@@ -2501,7 +3650,7 @@ export default function App() {
             </div>
             <div className="status-chip">
               <span className="status-light" aria-hidden="true" />
-              {authProfile.role === "entrepreneur" ? "Entrepreneur" : "Player"}
+              {roleLabel(authProfile.role)}
             </div>
             <button className="auth-logout" type="button" onClick={logout}>
               Logout

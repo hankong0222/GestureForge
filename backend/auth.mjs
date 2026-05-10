@@ -206,6 +206,7 @@ export async function signupUser(body) {
 export async function loginUser(body) {
   const email = normalizeEmail(body.email);
   const password = String(body.password ?? "");
+  const requestedRole = body.role === "entrepreneur" || body.role === "player" ? body.role : "";
   const users = await readUsers();
   const user = users.find((candidate) => candidate.email === email);
 
@@ -213,5 +214,13 @@ export async function loginUser(body) {
     return { status: 401, payload: { error: "Invalid email or password." } };
   }
 
-  return { status: 200, payload: { user: publicUser(user) } };
+  return {
+    status: 200,
+    payload: {
+      user: publicUser({
+        ...user,
+        role: requestedRole || user.role,
+      }),
+    },
+  };
 }

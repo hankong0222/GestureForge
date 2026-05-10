@@ -24,7 +24,7 @@ q or Esc  close the camera window
 s         save a screenshot to runs/hand_skeleton
 ```
 
-## Composio Game Control Analysis
+## Local Game Control Analysis
 
 Start the backend that receives GitHub URLs or zip uploads, creates session
 folders, runs analysis, and serves the session game folder:
@@ -33,10 +33,10 @@ folders, runs analysis, and serves the session game folder:
 npm run backend
 ```
 
-By default the backend skips generated/UI-heavy folders, ranks likely input
-files first, and sends only a small evidence set to the agent to avoid TPM
-limits: `ANALYZER_MODEL=gpt-4o-mini`, `ANALYZER_MAX_FILES=50`,
-`ANALYZER_MAX_EVIDENCE=25`, and `ANALYZER_MAX_CONTEXT_LINES=1`.
+By default the backend runs the local keyboard evidence scanner, skips
+generated/UI-heavy folders, and keeps the scan bounded with:
+`ANALYZER_MAX_FILES=50`, `ANALYZER_MAX_EVIDENCE=25`, and
+`ANALYZER_MAX_CONTEXT_LINES=1`.
 
 Check it is running:
 
@@ -131,6 +131,25 @@ planner or an engine-specific planner is needed.
 Analyze a game's source code and extract keyboard controls:
 
 ```powershell
+python tools\analyze_game_controls_local.py --source path\to\game --json-out runs\controls.json
+```
+
+To inspect only the local keyboard evidence:
+
+```powershell
+python tools\analyze_game_controls_local.py --source path\to\game --collect-only
+```
+
+The script scans source files for keyboard input evidence and returns a control
+manifest. Each control is shaped for the next GestureForge step: show it to the
+user, let the user select controls, then replace selected keyboard checks with
+GestureForge control functions.
+
+<!--
+Legacy Composio analyzer notes, kept disabled because the current local flow
+must not create a Composio session:
+
+```powershell
 python -m pip install composio composio-openai-agents openai-agents
 Copy-Item .env.example .env
 # Edit .env and fill in COMPOSIO_API_KEY and OPENAI_API_KEY.
@@ -149,12 +168,7 @@ To inspect only the local keyboard evidence before calling Composio:
 ```powershell
 python tools\analyze_game_controls_with_composio.py --source path\to\game --collect-only
 ```
-
-The script first scans source files for keyboard input evidence, then sends the
-evidence to a Composio-backed OpenAI Agent and returns a control manifest. Each
-control is shaped for the next GestureForge step: show it to the user, let the
-user select controls, then replace selected keyboard checks with GestureForge
-control functions.
+-->
 
 ## Cloudinary Recording + AI Video Analysis
 

@@ -37,7 +37,13 @@ class LazyHandTracker:
         self.handedness_label = None
         self.landmark_points = None
         self.lock = threading.Lock()
-        threading.Thread(target=self._load, daemon=True).start()
+
+    def status(self) -> str:
+        with self.lock:
+            if self.ready:
+                return "ready"
+
+            return self.error or "loading"
 
     def _load(self) -> None:
         try:
@@ -125,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stream the live GestureForge hand skeleton overlay.")
     parser.add_argument("--host", default="127.0.0.1", help="HTTP host.")
     parser.add_argument("--port", type=int, default=8791, help="HTTP port.")
-    parser.add_argument("--camera", type=int, default=0, help="Webcam index.")
+    parser.add_argument("--camera", type=int, default=-1, help="Webcam index. Use -1 to auto-detect.")
     parser.add_argument("--width", type=int, default=640, help="Requested camera width.")
     parser.add_argument("--height", type=int, default=480, help="Requested camera height.")
     parser.add_argument("--mirror", action="store_true", help="Mirror the webcam image.")
@@ -139,32 +145,87 @@ def parse_args() -> argparse.Namespace:
 class HandCamera:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.capture = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-
-        if not self.capture.isOpened():
-            raise RuntimeError(f"Could not open camera index {args.camera}")
-
+        self.capture, self.camera_index = self.open_capture()
         self.tracker = LazyHandTracker(args)
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
         self.previous_time = time.perf_counter()
         self.fps = 0.0
+        self.latest_frame: bytes | None = None
         self.latest_state: dict[str, object] = {
             "hands": 0,
+            "trackerStatus": "loading",
             "indexExtended": False,
             "indexFolded": False,
             "updatedAt": 0.0,
         }
+        self.worker = threading.Thread(target=self.capture_loop, daemon=True)
+        self.worker.start()
+
+    def open_capture(self):
+        indices = [self.args.camera] if self.args.camera >= 0 else list(range(6))
+        backends = [
+            ("DSHOW", cv2.CAP_DSHOW),
+            ("MSMF", cv2.CAP_MSMF),
+            ("ANY", cv2.CAP_ANY),
+        ]
+        errors: list[str] = []
+
+        for index in indices:
+            for backend_name, backend in backends:
+                capture = cv2.VideoCapture(index, backend)
+                capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.args.width)
+                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.args.height)
+
+                if capture.isOpened():
+                    ok, _ = capture.read()
+
+                    if ok:
+                        print(f"Using camera index {index} via {backend_name}", flush=True)
+                        return capture, index
+
+                capture.release()
+                errors.append(f"{index}/{backend_name}")
+
+        hint = ", ".join(errors[:12])
+        raise RuntimeError(f"Could not open a usable camera. Tried {hint}.")
 
     def close(self) -> None:
+        self.stop_event.set()
+        self.worker.join(timeout=1)
         self.tracker.close()
         self.capture.release()
 
-    def frame(self) -> bytes | None:
-        ok, frame = self.capture.read()
+    def state(self) -> dict[str, object]:
+        with self.lock:
+            return dict(self.latest_state)
 
-        if not ok:
+    def frame(self) -> bytes | None:
+        with self.lock:
+            return self.latest_frame
+
+    def capture_loop(self) -> None:
+        self.tracker._load()
+
+        while not self.stop_event.is_set():
+            ok, frame = self.capture.read()
+
+            if not ok:
+                time.sleep(0.05)
+                continue
+
+            encoded = self.process_frame(frame)
+
+            if encoded is not None:
+                with self.lock:
+                    self.latest_frame = encoded
+
+            time.sleep(0.01)
+
+    def process_frame(self, frame) -> bytes | None:
+        if frame is None:
             return None
+
 
         if self.args.mirror:
             frame = cv2.flip(frame, 1)
@@ -176,14 +237,17 @@ class HandCamera:
             for finger in ("thumb", "index", "middle", "ring", "pinky")
         }
         index_extended = aggregate_states["index"]
-        self.latest_state = {
+        latest_state = {
             "hands": len(hand_states),
+            "trackerStatus": tracker_status,
             "fingers": aggregate_states,
             "indexExtended": index_extended,
             "indexFolded": bool(hand_states) and not index_extended,
             "handsDetail": hand_states,
             "updatedAt": time.time(),
         }
+        with self.lock:
+            self.latest_state = latest_state
 
         now = time.perf_counter()
         elapsed = now - self.previous_time
@@ -205,47 +269,53 @@ def make_handler(camera: HandCamera, shutdown_server) -> type[BaseHTTPRequestHan
         def log_message(self, format: str, *args: object) -> None:
             return
 
+        def send_payload(
+            self,
+            status: int,
+            payload: bytes = b"",
+            content_type: str = "application/json",
+            cache_control: str | None = None,
+        ) -> bool:
+            try:
+                self.send_response(status)
+                if cache_control:
+                    self.send_header("Cache-Control", cache_control)
+                if content_type:
+                    self.send_header("Content-Type", content_type)
+                if payload:
+                    self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if payload:
+                    self.wfile.write(payload)
+                return True
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                return False
+
         def do_POST(self) -> None:
             if self.path == "/shutdown":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"status":"stopping"}')
+                self.send_payload(200, b'{"status":"stopping"}')
                 threading.Thread(target=shutdown_server, daemon=True).start()
                 return
 
-            self.send_response(404)
-            self.end_headers()
+            self.send_payload(404, b'{"error":"not found"}')
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"status":"ok"}')
+                self.send_payload(200, b'{"status":"ok"}')
                 return
 
             if self.path == "/state":
-                payload = json.dumps(camera.latest_state).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
+                payload = json.dumps(camera.state()).encode("utf-8")
+                self.send_payload(200, payload, cache_control="no-store")
                 return
 
             if self.path == "/shutdown":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"status":"stopping"}')
+                self.send_payload(200, b'{"status":"stopping"}')
                 threading.Thread(target=shutdown_server, daemon=True).start()
                 return
 
             if self.path != "/video":
-                self.send_response(404)
-                self.end_headers()
+                self.send_payload(404, b'{"error":"not found"}')
                 return
 
             self.send_response(200)
@@ -257,7 +327,8 @@ def make_handler(camera: HandCamera, shutdown_server) -> type[BaseHTTPRequestHan
                 frame = camera.frame()
 
                 if frame is None:
-                    break
+                    time.sleep(0.05)
+                    continue
 
                 try:
                     self.wfile.write(b"--frame\r\n")
@@ -265,7 +336,7 @@ def make_handler(camera: HandCamera, shutdown_server) -> type[BaseHTTPRequestHan
                     self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
                     self.wfile.write(frame)
                     self.wfile.write(b"\r\n")
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     break
 
     return Handler

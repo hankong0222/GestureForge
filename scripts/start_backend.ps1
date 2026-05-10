@@ -1,7 +1,6 @@
 param(
   [int]$Port = 8787,
   [string]$Python = "",
-  [string]$Model = "gpt-4o-mini",
   [int]$MaxFiles = 50,
   [int]$MaxEvidence = 25,
   [int]$MaxContextLines = 1
@@ -26,9 +25,31 @@ function Get-ListeningPids {
   @($Pids | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
 }
 
+$EnvPath = Join-Path $ProjectRoot ".env"
+if (Test-Path $EnvPath) {
+  Get-Content $EnvPath | ForEach-Object {
+    $Line = $_.Trim()
+    if (-not $Line -or $Line.StartsWith("#") -or -not $Line.Contains("=")) {
+      return
+    }
+
+    $Name, $Value = $Line.Split("=", 2)
+    if ($Name) {
+      [Environment]::SetEnvironmentVariable($Name.Trim(), $Value.Trim(), "Process")
+    }
+  }
+}
+
 if (-not $Python) {
+  $CodexPython = if ($env:USERPROFILE) {
+    Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+  } else {
+    ""
+  }
   $PythonCandidates = @(
+    $env:PYTHON,
     (Join-Path $ProjectRoot "venv\Scripts\python.exe"),
+    $CodexPython,
     "py",
     "python"
   )
@@ -49,26 +70,40 @@ if (-not $Python) {
   throw "Could not find a working Python executable. Pass -Python `"C:\path\to\python.exe`"."
 }
 
-Set-Location $ProjectRoot
+$GitExecutable = ""
+$GitCandidates = @(
+  $env:GIT_EXECUTABLE,
+  $env:GIT_PATH,
+  "git",
+  "git.exe",
+  "C:\Program Files\Git\cmd\git.exe",
+  "C:\Program Files (x86)\Git\cmd\git.exe",
+  "D:\Git\cmd\git.exe"
+)
 
-$EnvPath = Join-Path $ProjectRoot ".env"
-if (Test-Path $EnvPath) {
-  Get-Content $EnvPath | ForEach-Object {
-    $Line = $_.Trim()
-    if (-not $Line -or $Line.StartsWith("#") -or -not $Line.Contains("=")) {
-      return
-    }
+foreach ($Candidate in $GitCandidates) {
+  if (-not $Candidate) {
+    continue
+  }
 
-    $Name, $Value = $Line.Split("=", 2)
-    if ($Name) {
-      [Environment]::SetEnvironmentVariable($Name.Trim(), $Value.Trim(), "Process")
+  try {
+    $VersionOutput = & $Candidate --version 2>$null
+    if ($LASTEXITCODE -eq 0 -and $VersionOutput) {
+      $GitExecutable = $Candidate
+      break
     }
+  } catch {
   }
 }
 
+if ($GitExecutable) {
+  $env:GIT_EXECUTABLE = $GitExecutable
+}
+
+Set-Location $ProjectRoot
+
 $env:PORT = "$Port"
 $env:PYTHON = $Python
-$env:ANALYZER_MODEL = $Model
 $env:ANALYZER_MAX_FILES = "$MaxFiles"
 $env:ANALYZER_MAX_EVIDENCE = "$MaxEvidence"
 $env:ANALYZER_MAX_CONTEXT_LINES = "$MaxContextLines"
@@ -95,7 +130,9 @@ if ($ExistingPids.Count -gt 0) {
 
 Write-Host "Starting GestureForge backend on http://localhost:$Port"
 Write-Host "Using Python executable: $Python"
+$GitLabel = if ($env:GIT_EXECUTABLE) { $env:GIT_EXECUTABLE } else { "git from PATH" }
+Write-Host "Using Git executable: $GitLabel"
 Write-Host "Camera stream will auto-start from backend at http://localhost:$Port/api/camera/video"
-Write-Host "Analyzer model: $Model"
+Write-Host "Analyzer: local keyboard evidence scanner"
 Write-Host "Analyzer scan limits: max_files=$MaxFiles max_evidence=$MaxEvidence max_context_lines=$MaxContextLines"
 npm run backend
