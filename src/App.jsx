@@ -50,20 +50,6 @@ const emptyAnalysis = {
   unresolved: [],
 };
 
-function loadSavedUiState() {
-  try {
-    const saved = JSON.parse(window.localStorage.getItem(savedStateKey) || "{}");
-
-    if (!saved || typeof saved !== "object") {
-      return {};
-    }
-
-    return saved;
-  } catch {
-    return {};
-  }
-}
-
 function normalizeFingerCombo(fingers) {
   const selected = new Set(Array.isArray(fingers) ? fingers : []);
   return fingerControls.map((finger) => finger.id).filter((finger) => selected.has(finger));
@@ -232,8 +218,36 @@ function clipPlanStatusLabel(status) {
   return labels[status] ?? "IDLE";
 }
 
+function clipRenderStatusLabel(status) {
+  const labels = {
+    idle: "IDLE",
+    loading: "LOADING",
+    rendering: "RENDERING",
+    rendered: "READY",
+    stale: "STALE",
+    failed: "FAILED",
+  };
+
+  return labels[status] ?? "IDLE";
+}
+
 function formatSeconds(seconds) {
   return formatDuration(Number(seconds || 0) * 1000);
+}
+
+function cloneClipPlan(plan) {
+  if (!plan) {
+    return null;
+  }
+
+  return JSON.parse(JSON.stringify(plan));
+}
+
+function clipTitleText(clip) {
+  return clip?.overlays?.find((overlay) => overlay?.type === "text" && overlay.role === "meme_title")?.text
+    || clip?.source_highlight?.title
+    || clip?.id
+    || "Funny Moment";
 }
 
 function BrandMark() {
@@ -261,6 +275,131 @@ function SettingsGlyph() {
 
 function RecordGlyph() {
   return <span className="record-glyph" aria-hidden="true" />;
+}
+
+function AuthGate({ onAuthenticate }) {
+  const [role, setRole] = useState("entrepreneur");
+  const [mode, setMode] = useState("login");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [verificationCode, setVerificationCode] = useState("");
+  const [needsVerification, setNeedsVerification] = useState(false);
+  const [authNotice, setAuthNotice] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  async function submitAuth(event) {
+    event.preventDefault();
+    setAuthError("");
+    setAuthNotice("");
+    setIsSubmitting(true);
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/auth/${mode === "signup" ? "signup" : "login"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          role,
+          name: name.trim(),
+          email: email.trim(),
+          password,
+          verification_code: needsVerification ? verificationCode.trim() : undefined,
+        }),
+      });
+      const payload = await response.json();
+
+      if (response.status === 202 && payload.status === "verification_required") {
+        setNeedsVerification(true);
+        setAuthNotice(
+          payload.email_status === "sent"
+            ? "Verification code sent. Check your email."
+            : `Email not sent: ${payload.email_error || "Pingram is not configured."}${payload.dev_verification_code ? ` Code: ${payload.dev_verification_code}` : ""}`,
+        );
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Authentication failed.");
+      }
+
+      onAuthenticate({
+        ...payload.user,
+        signedInAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      setAuthError(error.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  return (
+    <main className="auth-shell">
+      <section className="auth-panel" aria-labelledby="auth-title">
+        <div className="auth-brand">
+          <BrandMark />
+          <span>GestureForge</span>
+        </div>
+        <p className="eyebrow">Welcome</p>
+        <h1 id="auth-title">{mode === "login" ? "LOGIN" : "SIGN UP"}</h1>
+        <p className="intro">
+          Choose your workspace before forging keyboard controls into gestures.
+        </p>
+
+        <div className="role-switch" role="group" aria-label="Account type">
+          <button className={role === "entrepreneur" ? "is-active" : ""} type="button" onClick={() => setRole("entrepreneur")}>
+            Entrepreneur
+          </button>
+          <button className={role === "player" ? "is-active" : ""} type="button" onClick={() => setRole("player")}>
+            Player
+          </button>
+        </div>
+
+        <form className="auth-form" onSubmit={submitAuth}>
+          {mode === "signup" && (
+            <label>
+              <span>Name</span>
+              <input value={name} onChange={(event) => setName(event.target.value)} />
+            </label>
+          )}
+          <label>
+            <span>Email</span>
+            <input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} />
+          </label>
+          <label>
+            <span>Password</span>
+            <input required minLength={4} type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+          </label>
+          {mode === "signup" && needsVerification && (
+            <label>
+              <span>Verification Code</span>
+              <input required value={verificationCode} onChange={(event) => setVerificationCode(event.target.value)} />
+            </label>
+          )}
+          {authNotice && <p className="auth-notice">{authNotice}</p>}
+          {authError && <p className="auth-error">{authError}</p>}
+          <button className="pixel-button" disabled={isSubmitting} type="submit">
+            {isSubmitting ? "Please Wait" : mode === "login" ? "Login" : needsVerification ? "Verify & Create" : "Send Code"}
+          </button>
+        </form>
+
+        <button
+          className="auth-toggle"
+          type="button"
+          onClick={() => {
+            setMode(mode === "login" ? "signup" : "login");
+            setNeedsVerification(false);
+            setVerificationCode("");
+            setAuthError("");
+            setAuthNotice("");
+          }}
+        >
+          {mode === "login" ? "Need an account? Sign up" : "Already have an account? Login"}
+        </button>
+      </section>
+    </main>
+  );
 }
 
 function StepTabs({ currentStep, onStepChange, canOpenStep }) {
@@ -566,7 +705,15 @@ function UploadPanel({
             <span className="mini-led">{sessionStatus || "IDLE"}</span>
           </div>
           {session?.session_id && <code>{session.session_id}</code>}
-          {isWorking && <p>Backend is preparing the source and extracting keyboard controls.</p>}
+          {sessionStatus === "cloning" && <p>Backend is cloning the GitHub source.</p>}
+          {sessionStatus === "cloned" && <p>Source cloned. Analyzer is starting.</p>}
+          {sessionStatus === "analyzing" && session?.cloned_at && <p>Source cloned. Analyzer is extracting keyboard controls.</p>}
+          {sessionStatus === "analyzing" && session?.analysis_stage?.stage && (
+            <p>Analyzer stage: <code>{session.analysis_stage.stage}</code></p>
+          )}
+          {isWorking && sessionStatus !== "cloning" && sessionStatus !== "cloned" && !(sessionStatus === "analyzing" && session?.cloned_at) && (
+            <p>Backend is preparing the source and extracting keyboard controls.</p>
+          )}
           {errorMessage && <p className="error-text">{errorMessage}</p>}
         </div>
       )}
@@ -941,21 +1088,32 @@ function RecordingPreviewPanel({
   videoAnalysisError,
   videoAnalysisStatus,
   clipPlan,
+  clipPlanDraft,
   clipPlanError,
   clipPlanStatus,
+  clipRender,
+  clipRenderError,
+  clipRenderStatus,
   analysisFeedback,
   analysisPrompt,
   isSavingAnalysisFeedback,
   onBack,
+  onClipAssetChange,
+  onClipTextChange,
+  onClipTrimChange,
   onFeedbackChange,
   onPromptChange,
+  onRenderClipPlan,
   onRestart,
   onSubmitFeedback,
 }) {
   const transcriptSegments = videoAnalysis?.transcription?.segments ?? [];
   const audioEvents = videoAnalysis?.audio?.events ?? [];
   const highlights = videoAnalysis?.highlights ?? videoAnalysis?.multimodal?.funny_moments ?? [];
-  const plannedClips = clipPlan?.sequence?.clips ?? [];
+  const editablePlan = clipPlanDraft ?? clipPlan;
+  const plannedClips = editablePlan?.sequence?.clips ?? [];
+  const memeAssets = (editablePlan?.asset_catalog ?? []).filter((asset) => asset.kind === "meme");
+  const soundAssets = (editablePlan?.asset_catalog ?? []).filter((asset) => asset.kind === "sound");
 
   return (
     <section className="recording-preview-panel" aria-label="Recording preview">
@@ -1108,17 +1266,17 @@ function RecordingPreviewPanel({
           <span className="mini-led">{clipPlanStatusLabel(clipPlanStatus)}</span>
         </div>
         {clipPlanError && <p className="recording-error">{clipPlanError}</p>}
-        {clipPlan?.output && (
+        {editablePlan?.output && (
           <p className="patch-note">
-            {clipPlan.output.width}x{clipPlan.output.height} / {clipPlan.output.aspect_ratio} / {clipPlan.output.format}
-            {clipPlan.asset_policy?.allowed_asset_ids?.length ? ` / ${clipPlan.asset_policy.allowed_asset_ids.length} LOCAL ASSETS` : ""}
+            {editablePlan.output.width}x{editablePlan.output.height} / {editablePlan.output.aspect_ratio} / {editablePlan.output.format}
+            {editablePlan.asset_policy?.allowed_asset_ids?.length ? ` / ${editablePlan.asset_policy.allowed_asset_ids.length} LOCAL ASSETS` : ""}
           </p>
         )}
         <div className="clip-plan-list">
           {plannedClips.map((clip) => (
             <article className="clip-plan-card" key={clip.id}>
               <div className="clip-plan-head">
-                <strong>{clip.overlays?.[0]?.text || clip.source_highlight?.title || clip.id}</strong>
+                <strong>{clipTitleText(clip)}</strong>
                 <kbd>{formatSeconds(clip.trim?.start)} - {formatSeconds(clip.trim?.end)}</kbd>
               </div>
               <div className="clip-plan-grid">
@@ -1129,15 +1287,98 @@ function RecordingPreviewPanel({
                 <span>Zoom {clip.effects?.zoom?.enabled ? "on" : "off"}</span>
                 <span>Freeze {clip.effects?.freeze_frame?.enabled ? `${clip.effects.freeze_frame.duration}s` : "off"}</span>
               </div>
-              <div className="clip-asset-row">
-                <span>Meme {clip.selected_assets?.meme || "none"}</span>
-                <span>Sound {clip.selected_assets?.sound || "none"}</span>
+              <div className="clip-tune-grid">
+                <label>
+                  <span>Start</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.1"
+                    value={clip.trim?.start ?? 0}
+                    onChange={(event) => onClipTrimChange(clip.id, "start", event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>End</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.1"
+                    value={clip.trim?.end ?? 0}
+                    onChange={(event) => onClipTrimChange(clip.id, "end", event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>Meme</span>
+                  <select
+                    value={clip.selected_assets?.meme ?? ""}
+                    onChange={(event) => onClipAssetChange(clip.id, "meme", event.target.value)}
+                  >
+                    <option value="">None</option>
+                    {memeAssets.map((asset) => (
+                      <option key={asset.id} value={asset.id}>{asset.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Sound</span>
+                  <select
+                    value={clip.selected_assets?.sound ?? ""}
+                    onChange={(event) => onClipAssetChange(clip.id, "sound", event.target.value)}
+                  >
+                    <option value="">None</option>
+                    {soundAssets.map((asset) => (
+                      <option key={asset.id} value={asset.id}>{asset.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="clip-title-field">
+                  <span>Text</span>
+                  <input
+                    value={clipTitleText(clip)}
+                    onChange={(event) => onClipTextChange(clip.id, event.target.value)}
+                  />
+                </label>
               </div>
               {clip.captions?.[0]?.text && <p>{clip.captions[0].text}</p>}
             </article>
           ))}
           {!plannedClips.length && <p className="analysis-empty">Waiting for Backboard highlights to generate the edit plan.</p>}
         </div>
+      </div>
+
+      <div className="clip-render-board" aria-label="Cloudinary render">
+        <div className="board-title">
+          <span>Cloudinary MP4</span>
+          <span className="mini-led">{clipRenderStatusLabel(clipRenderStatus)}</span>
+        </div>
+        {clipRenderError && <p className="recording-error">{clipRenderError}</p>}
+        <div className="clip-render-actions">
+          <button
+            className="pixel-button"
+            disabled={!plannedClips.length || clipRenderStatus === "rendering" || !cloudinaryAsset?.backend_recording_id}
+            type="button"
+            onClick={onRenderClipPlan}
+          >
+            {clipRenderStatus === "rendering" ? "Rendering" : "Render MP4"}
+          </button>
+          {clipRender?.download_url && (
+            <a className="pixel-button secondary download-link" href={clipRender.download_url} download target="_blank" rel="noreferrer">
+              Download MP4
+            </a>
+          )}
+        </div>
+        {clipRender?.final_url && (
+          <div className="rendered-video">
+            <video src={clipRender.final_url} controls />
+          </div>
+        )}
+        {clipRender?.final_public_id && (
+          <div className="play-map-row">
+            <span>Final ID</span>
+            <kbd>{clipRender.final_public_id}</kbd>
+          </div>
+        )}
       </div>
     </section>
   );
@@ -1181,43 +1422,46 @@ function GesturePreview({ mappings, analysis }) {
 }
 
 export default function App() {
-  const savedUiState = useMemo(loadSavedUiState, []);
   const fileInputRef = useRef(null);
+  const [authProfile, setAuthProfile] = useState(null);
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
   const recordingStreamRef = useRef(null);
   const recordingStartedAtRef = useRef(0);
   const recordingClipUrlRef = useRef("");
   const recordingCancelledRef = useRef(false);
-  const sessionRef = useRef(savedUiState.session ?? null);
+  const sessionRef = useRef(null);
   const [selectedFile, setSelectedFile] = useState(null);
-  const [githubUrl, setGithubUrl] = useState(savedUiState.githubUrl ?? "");
+  const [githubUrl, setGithubUrl] = useState("");
   const [isDragging, setIsDragging] = useState(false);
-  const [currentStep, setCurrentStep] = useState(() => {
-    const restoredStep = savedUiState.currentStep ?? 1;
-
-    if (restoredStep === 3 && savedUiState.patchReport?.status !== "patched") {
-      return 2;
-    }
-
-    if (restoredStep === 4) {
-      return savedUiState.patchReport?.status === "patched" ? 3 : 2;
-    }
-
-    return restoredStep;
-  });
-  const [analysis, setAnalysis] = useState(savedUiState.analysis ?? emptyAnalysis);
-  const [session, setSession] = useState(savedUiState.session ?? null);
-  const [sessionStatus, setSessionStatus] = useState(savedUiState.sessionStatus ?? "");
-  const [mappings, setMappings] = useState(savedUiState.mappings ?? {});
-  const [draftMappings, setDraftMappings] = useState(savedUiState.draftMappings ?? {});
-  const [selectedControlId, setSelectedControlId] = useState(savedUiState.selectedControlId ?? "");
+  const [currentStep, setCurrentStep] = useState(1);
+  const [analysis, setAnalysis] = useState(emptyAnalysis);
+  const [session, setSession] = useState(null);
+  const [sessionStatus, setSessionStatus] = useState("");
+  const [mappings, setMappings] = useState({});
+  const [draftMappings, setDraftMappings] = useState({});
+  const [selectedControlId, setSelectedControlId] = useState("");
   const [conflictPulse, setConflictPulse] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
-  const [patchReport, setPatchReport] = useState(savedUiState.patchReport ?? null);
+  const [patchReport, setPatchReport] = useState(null);
   const [isPlanningPatch, setIsPlanningPatch] = useState(false);
   const [isApplyingPatch, setIsApplyingPatch] = useState(false);
   const [patchApplyError, setPatchApplyError] = useState("");
+
+  function authenticate(profile) {
+    setAuthProfile(profile);
+    window.localStorage.removeItem(savedStateKey);
+    setCurrentStep(1);
+    setSession(null);
+    setSessionStatus("");
+    setAnalysis(emptyAnalysis);
+  }
+
+  function logout() {
+    setAuthProfile(null);
+    window.localStorage.removeItem(savedStateKey);
+    handleReset();
+  }
   const [recordingStatus, setRecordingStatus] = useState("idle");
   const [recordingError, setRecordingError] = useState("");
   const [recordedClip, setRecordedClip] = useState(null);
@@ -1230,6 +1474,10 @@ export default function App() {
   const [clipPlanStatus, setClipPlanStatus] = useState("idle");
   const [clipPlanError, setClipPlanError] = useState("");
   const [clipPlan, setClipPlan] = useState(null);
+  const [clipPlanDraft, setClipPlanDraft] = useState(null);
+  const [clipRenderStatus, setClipRenderStatus] = useState("idle");
+  const [clipRenderError, setClipRenderError] = useState("");
+  const [clipRender, setClipRender] = useState(null);
   const [analysisPrompt, setAnalysisPrompt] = useState("");
   const [analysisFeedback, setAnalysisFeedback] = useState("");
   const [isSavingAnalysisFeedback, setIsSavingAnalysisFeedback] = useState(false);
@@ -1340,6 +1588,7 @@ export default function App() {
       const statusResponse = await fetch(`${apiBaseUrl}/api/sessions/${sessionId}`);
       const statusPayload = await statusResponse.json();
       setSessionStatus(statusPayload.status);
+      setSession((currentSession) => ({ ...(currentSession ?? {}), ...statusPayload }));
 
       if (statusPayload.status === "failed") {
         throw new Error(statusPayload.hint || statusPayload.error || "Session analysis failed.");
@@ -1632,10 +1881,161 @@ export default function App() {
       }
 
       setClipPlan(payload.plan);
+      setClipPlanDraft(cloneClipPlan(payload.plan));
       setClipPlanStatus(payload.clip_plan_status || payload.plan?.status || "planned");
+      fetchClipRender(recordingId);
     } catch (error) {
       setClipPlanStatus("failed");
       setClipPlanError(error.message);
+    }
+  }
+
+  async function fetchClipRender(recordingId) {
+    setClipRenderStatus("loading");
+    setClipRenderError("");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/recordings/${recordingId}/render`, {
+        cache: "no-store",
+      });
+      const payload = await response.json();
+
+      if (response.status === 404) {
+        setClipRender(null);
+        setClipRenderStatus("idle");
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Could not load rendered MP4.");
+      }
+
+      setClipRender(payload.render);
+      setClipRenderStatus(payload.clip_render_status || payload.render?.status || "rendered");
+    } catch (error) {
+      setClipRenderStatus("failed");
+      setClipRenderError(error.message);
+    }
+  }
+
+  function markClipRenderStale() {
+    setClipRenderError("");
+    setClipRenderStatus((currentStatus) => (clipRender || currentStatus === "rendered" ? "stale" : currentStatus));
+  }
+
+  function updateClipPlanDraft(mutator) {
+    markClipRenderStale();
+    setClipPlanDraft((currentPlan) => {
+      const nextPlan = cloneClipPlan(currentPlan ?? clipPlan);
+
+      if (!nextPlan) {
+        return currentPlan;
+      }
+
+      mutator(nextPlan);
+      return nextPlan;
+    });
+  }
+
+  function updateClipTrim(clipId, field, value) {
+    updateClipPlanDraft((nextPlan) => {
+      const clip = nextPlan.sequence?.clips?.find((item) => item.id === clipId);
+
+      if (!clip) {
+        return;
+      }
+
+      const nextValue = Math.max(0, Number(value) || 0);
+      const trim = clip.trim ?? { start: 0, end: 1, duration: 1 };
+
+      if (field === "start") {
+        trim.start = nextValue;
+        trim.end = Math.max(trim.end ?? nextValue + 0.8, nextValue + 0.8);
+      } else {
+        trim.end = Math.max(nextValue, (trim.start ?? 0) + 0.8);
+      }
+
+      trim.duration = Number(Math.max(0.8, trim.end - trim.start).toFixed(2));
+      clip.trim = {
+        ...trim,
+        start: Number(trim.start.toFixed(2)),
+        end: Number(trim.end.toFixed(2)),
+      };
+    });
+  }
+
+  function updateClipAsset(clipId, kind, value) {
+    updateClipPlanDraft((nextPlan) => {
+      const clip = nextPlan.sequence?.clips?.find((item) => item.id === clipId);
+
+      if (!clip) {
+        return;
+      }
+
+      clip.selected_assets = {
+        ...(clip.selected_assets ?? {}),
+        [kind]: value || null,
+      };
+    });
+  }
+
+  function updateClipText(clipId, value) {
+    updateClipPlanDraft((nextPlan) => {
+      const clip = nextPlan.sequence?.clips?.find((item) => item.id === clipId);
+
+      if (!clip) {
+        return;
+      }
+
+      clip.overlays = Array.isArray(clip.overlays) ? clip.overlays : [];
+
+      let titleOverlay = clip.overlays.find((overlay) => overlay?.type === "text" && overlay.role === "meme_title");
+
+      if (!titleOverlay) {
+        titleOverlay = {
+          type: "text",
+          role: "meme_title",
+          position: "top",
+          start: 0,
+          duration: Math.min(2.8, Number(clip.trim?.duration || 2.8)),
+        };
+        clip.overlays.unshift(titleOverlay);
+      }
+
+      titleOverlay.text = value;
+    });
+  }
+
+  async function renderClipPlanToCloudinary() {
+    const recordingId = cloudinaryAsset?.backend_recording_id;
+
+    if (!recordingId) {
+      setClipRenderError("Cloudinary recording must be stored before rendering.");
+      return;
+    }
+
+    setClipRenderStatus("rendering");
+    setClipRenderError("");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/recordings/${recordingId}/render`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan: clipPlanDraft ?? clipPlan,
+        }),
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Cloudinary render failed.");
+      }
+
+      setClipRender(payload.render);
+      setClipRenderStatus(payload.clip_render_status || payload.render?.status || "rendered");
+    } catch (error) {
+      setClipRenderStatus("failed");
+      setClipRenderError(error.message);
     }
   }
 
@@ -1667,8 +2067,12 @@ export default function App() {
 
       setVideoAnalysis(null);
       setClipPlan(null);
+      setClipPlanDraft(null);
       setClipPlanStatus("stale");
       setClipPlanError("");
+      setClipRender(null);
+      setClipRenderStatus("stale");
+      setClipRenderError("");
       setVideoAnalysisStatus(payload.analysis_status || "queued");
       pollVideoAnalysis(recordingId);
     } catch (error) {
@@ -1765,6 +2169,10 @@ export default function App() {
     setClipPlanStatus("idle");
     setClipPlanError("");
     setClipPlan(null);
+    setClipPlanDraft(null);
+    setClipRenderStatus("idle");
+    setClipRenderError("");
+    setClipRender(null);
     setAnalysisFeedback("");
 
     try {
@@ -1897,6 +2305,10 @@ export default function App() {
     setClipPlanStatus("idle");
     setClipPlanError("");
     setClipPlan(null);
+    setClipPlanDraft(null);
+    setClipRenderStatus("idle");
+    setClipRenderError("");
+    setClipRender(null);
     setAnalysisPrompt("");
     setAnalysisFeedback("");
     setIsSavingAnalysisFeedback(false);
@@ -2008,14 +2420,22 @@ export default function App() {
           videoAnalysisError={videoAnalysisError}
           videoAnalysisStatus={videoAnalysisStatus}
           clipPlan={clipPlan}
+          clipPlanDraft={clipPlanDraft}
           clipPlanError={clipPlanError}
           clipPlanStatus={clipPlanStatus}
+          clipRender={clipRender}
+          clipRenderError={clipRenderError}
+          clipRenderStatus={clipRenderStatus}
           analysisFeedback={analysisFeedback}
           analysisPrompt={analysisPrompt}
           isSavingAnalysisFeedback={isSavingAnalysisFeedback}
           onBack={() => setCurrentStep(canOpenStep(3) ? 3 : analysis.controls?.length ? 2 : 1)}
+          onClipAssetChange={updateClipAsset}
+          onClipTextChange={updateClipText}
+          onClipTrimChange={updateClipTrim}
           onFeedbackChange={setAnalysisFeedback}
           onPromptChange={setAnalysisPrompt}
+          onRenderClipPlan={renderClipPlanToCloudinary}
           onRestart={handleRestart}
           onSubmitFeedback={submitVideoAnalysisFeedback}
         />
@@ -2054,12 +2474,20 @@ export default function App() {
   );
 
   if (currentStep === 3) {
+    if (!authProfile) {
+      return <AuthGate onAuthenticate={authenticate} />;
+    }
+
     return (
       <>
         {renderStep()}
         {recordingOverlay}
       </>
     );
+  }
+
+  if (!authProfile) {
+    return <AuthGate onAuthenticate={authenticate} />;
   }
 
   return (
@@ -2073,8 +2501,11 @@ export default function App() {
             </div>
             <div className="status-chip">
               <span className="status-light" aria-hidden="true" />
-              Gesture Engine Ready
+              {authProfile.role === "entrepreneur" ? "Entrepreneur" : "Player"}
             </div>
+            <button className="auth-logout" type="button" onClick={logout}>
+              Logout
+            </button>
           </div>
 
           <StepTabs currentStep={currentStep} onStepChange={setCurrentStep} canOpenStep={canOpenStep} />

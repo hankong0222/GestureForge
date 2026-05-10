@@ -178,6 +178,7 @@ Required local configuration:
 Copy-Item .env.example .env
 # Fill OPENAI_API_KEY, VITE_CLOUDINARY_CLOUD_NAME, and VITE_CLOUDINARY_UPLOAD_PRESET.
 # Fill BACKBOARD_API_KEY for multimodal funny moment judgment and preference memory.
+# Fill CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET for server-side MP4 rendering.
 venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
@@ -186,6 +187,11 @@ venv\Scripts\python.exe -m pip install -r requirements.txt
 Relevant model defaults:
 
 ```env
+CLOUDINARY_CLOUD_NAME=your_cloudinary_cloud_name
+CLOUDINARY_API_KEY=your_cloudinary_api_key
+CLOUDINARY_API_SECRET=your_cloudinary_api_secret
+CLOUDINARY_RENDER_FOLDER=gestureforge-renders
+CLOUDINARY_ASSET_FOLDER=gestureforge-renders/assets
 OPENAI_TRANSCRIBE_MODEL=whisper-1
 BACKBOARD_API_KEY=your_backboard_api_key
 BACKBOARD_LLM_PROVIDER=openai
@@ -224,8 +230,24 @@ Invoke-RestMethod -Method Post http://localhost:8787/api/recordings/<recording_i
 
 The generated plan contains trim windows, 9:16 crop settings, splice order,
 caption segments, meme/title overlays, local meme/sound asset choices, and
-zoom/freeze-frame suggestions. It does not render the final mp4 yet; that is
-the next Cloudinary transformation step.
+zoom/freeze-frame suggestions.
+
+Render the edited Cloudinary MP4 from the current plan:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://localhost:8787/api/recordings/<recording_id>/render `
+  -ContentType application/json `
+  -Body '{"plan":null}'
+Invoke-RestMethod http://localhost:8787/api/recordings/<recording_id>/render
+```
+
+Rendering first syncs only the allowed local `asset` catalog into your
+Cloudinary account, builds each trimmed/cropped/overlaid clip, uploads those
+derived clips, splices them into a final MP4, and writes the manifest to
+`tmp/recordings/<recording_id>/clip-render.json`. Level 04 can also send a
+manually tuned plan body with updated trim times, title text, and meme/sound
+choices before rendering.
 
 The asset policy is intentionally locked down: clip plans may only reference
 the local `asset` catalog. Current allowed IDs are `meme_laugh`,

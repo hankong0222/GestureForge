@@ -11,21 +11,114 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
-import mediapipe as mp
 
-from hand_finger_states import finger_states
-from live_hand_skeleton import (
-    draw_finger_states,
-    draw_hand,
-    draw_handedness,
-    draw_label,
-    handedness_label,
-    landmark_points,
-)
+
+def draw_label(frame, text: str, origin: tuple[int, int], color: tuple[int, int, int]) -> None:
+    x, y = origin
+    cv2.putText(frame, text, (x + 2, y + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2, cv2.LINE_AA)
+
+
+class LazyHandTracker:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.ready = False
+        self.error = ""
+        self.hands = None
+        self.finger_states = None
+        self.draw_finger_states = None
+        self.draw_hand = None
+        self.draw_handedness = None
+        self.handedness_label = None
+        self.landmark_points = None
+        self.lock = threading.Lock()
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _load(self) -> None:
+        try:
+            import mediapipe as mp
+            from hand_finger_states import finger_states
+            from live_hand_skeleton import (
+                draw_finger_states,
+                draw_hand,
+                draw_handedness,
+                handedness_label,
+                landmark_points,
+            )
+
+            hands = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=self.args.max_hands,
+                model_complexity=1,
+                min_detection_confidence=self.args.detect_conf,
+                min_tracking_confidence=self.args.track_conf,
+            )
+            with self.lock:
+                self.hands = hands
+                self.finger_states = finger_states
+                self.draw_finger_states = draw_finger_states
+                self.draw_hand = draw_hand
+                self.draw_handedness = draw_handedness
+                self.handedness_label = handedness_label
+                self.landmark_points = landmark_points
+                self.ready = True
+        except Exception as error:
+            with self.lock:
+                self.error = str(error)
+
+    def close(self) -> None:
+        with self.lock:
+            hands = self.hands
+            self.hands = None
+            self.ready = False
+
+        if hands is not None:
+            hands.close()
+
+    def analyze(self, frame) -> tuple[list[dict[str, object]], str]:
+        with self.lock:
+            ready = self.ready
+            error = self.error
+            hands = self.hands
+            finger_states = self.finger_states
+            draw_finger_states = self.draw_finger_states
+            draw_hand = self.draw_hand
+            draw_handedness = self.draw_handedness
+            handedness_label = self.handedness_label
+            landmark_points = self.landmark_points
+
+        if not ready or hands is None:
+            return [], error or "loading"
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = hands.process(rgb)
+
+        height, width = frame.shape[:2]
+        landmarks = results.multi_hand_landmarks or []
+        handedness = results.multi_handedness or []
+        hand_states: list[dict[str, object]] = []
+
+        for index, hand_landmarks in enumerate(landmarks):
+            current_handedness = handedness[index] if index < len(handedness) else None
+            points = landmark_points(hand_landmarks, width, height)
+            states = finger_states(hand_landmarks, handedness_label(current_handedness))
+            draw_hand(frame, points)
+            draw_handedness(frame, points, current_handedness)
+            draw_finger_states(frame, points, states)
+            hand_states.append(
+                {
+                    "handedness": handedness_label(current_handedness),
+                    "states": states,
+                }
+            )
+
+        return hand_states, "ready"
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,13 +146,7 @@ class HandCamera:
         if not self.capture.isOpened():
             raise RuntimeError(f"Could not open camera index {args.camera}")
 
-        self.hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=args.max_hands,
-            model_complexity=1,
-            min_detection_confidence=args.detect_conf,
-            min_tracking_confidence=args.track_conf,
-        )
+        self.tracker = LazyHandTracker(args)
         self.previous_time = time.perf_counter()
         self.fps = 0.0
         self.latest_state: dict[str, object] = {
@@ -70,7 +157,7 @@ class HandCamera:
         }
 
     def close(self) -> None:
-        self.hands.close()
+        self.tracker.close()
         self.capture.release()
 
     def frame(self) -> bytes | None:
@@ -82,28 +169,7 @@ class HandCamera:
         if self.args.mirror:
             frame = cv2.flip(frame, 1)
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = self.hands.process(rgb)
-
-        height, width = frame.shape[:2]
-        landmarks = results.multi_hand_landmarks or []
-        handedness = results.multi_handedness or []
-        hand_states: list[dict[str, object]] = []
-
-        for index, hand_landmarks in enumerate(landmarks):
-            current_handedness = handedness[index] if index < len(handedness) else None
-            points = landmark_points(hand_landmarks, width, height)
-            states = finger_states(hand_landmarks, handedness_label(current_handedness))
-            draw_hand(frame, points)
-            draw_handedness(frame, points, current_handedness)
-            draw_finger_states(frame, points, states)
-            hand_states.append(
-                {
-                    "handedness": handedness_label(current_handedness),
-                    "states": states,
-                }
-            )
+        hand_states, tracker_status = self.tracker.analyze(frame)
 
         aggregate_states = {
             finger: any(bool(item["states"].get(finger)) for item in hand_states)
@@ -125,16 +191,31 @@ class HandCamera:
         self.fps = 0.9 * self.fps + 0.1 * (1 / elapsed) if self.fps else (1 / elapsed)
 
         draw_label(frame, f"FPS {self.fps:.1f}", (18, 34), (255, 214, 90))
-        draw_label(frame, f"Hands {len(landmarks)}", (18, 64), (93, 230, 255))
+        draw_label(frame, f"Hands {len(hand_states)}", (18, 64), (93, 230, 255))
+
+        if tracker_status != "ready":
+            draw_label(frame, f"MediaPipe {tracker_status}", (18, 94), (255, 95, 159))
 
         ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.args.jpeg_quality])
         return encoded.tobytes() if ok else None
 
 
-def make_handler(camera: HandCamera) -> type[BaseHTTPRequestHandler]:
+def make_handler(camera: HandCamera, shutdown_server) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
             return
+
+        def do_POST(self) -> None:
+            if self.path == "/shutdown":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"stopping"}')
+                threading.Thread(target=shutdown_server, daemon=True).start()
+                return
+
+            self.send_response(404)
+            self.end_headers()
 
         def do_GET(self) -> None:
             if self.path == "/health":
@@ -152,6 +233,14 @@ def make_handler(camera: HandCamera) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
+                return
+
+            if self.path == "/shutdown":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"stopping"}')
+                threading.Thread(target=shutdown_server, daemon=True).start()
                 return
 
             if self.path != "/video":
@@ -185,7 +274,7 @@ def make_handler(camera: HandCamera) -> type[BaseHTTPRequestHandler]:
 def main() -> None:
     args = parse_args()
     camera = HandCamera(args)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(camera))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(camera, lambda: server.shutdown()))
 
     print(f"GestureForge hand camera stream running at http://{args.host}:{args.port}/video")
     try:

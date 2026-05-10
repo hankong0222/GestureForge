@@ -20,6 +20,7 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -121,8 +122,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-evidence", type=int, default=220, help="Maximum evidence blocks to send to the agent.")
     parser.add_argument("--max-context-lines", type=int, default=2, help="Number of nearby lines kept around each evidence line.")
     parser.add_argument("--json-out", help="Optional path to write the final JSON result.")
+    parser.add_argument("--stage-out", help="Optional path to write analyzer stage diagnostics.")
     parser.add_argument("--collect-only", action="store_true", help="Only print local keyboard evidence, skip Composio.")
     return parser.parse_args()
+
+
+def write_stage(args: argparse.Namespace, stage: str, detail: str | None = None) -> None:
+    if not getattr(args, "stage_out", None):
+        return
+
+    payload = {
+        "stage": stage,
+        "pid": os.getpid(),
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+    if detail:
+        payload["detail"] = detail[:500]
+
+    stage_path = Path(args.stage_out)
+    stage_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = stage_path.with_name(f"{stage_path.name}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(stage_path)
+    print(f"[stage] {stage}", file=sys.stderr, flush=True)
 
 
 def load_dotenv(dotenv_path: Path) -> None:
@@ -152,6 +175,30 @@ def require_environment() -> None:
             f"Missing required environment variable(s): {joined}. "
             "Create a local .env from .env.example or set them in PowerShell."
         )
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def composio_workbench_config() -> dict[str, object]:
+    if not env_flag("COMPOSIO_WORKBENCH_ENABLED", default=False):
+        return {"enable": False}
+
+    sandbox_size = os.environ.get("COMPOSIO_WORKBENCH_SIZE", "medium").strip().lower()
+
+    if sandbox_size not in {"standard", "medium", "large", "xlarge"}:
+        sandbox_size = "medium"
+
+    return {
+        "enable": True,
+        "sandbox_size": sandbox_size,
+    }
 
 
 def iter_source_files(source: Path, max_files: int) -> list[Path]:
@@ -734,25 +781,36 @@ def normalize_agent_output(
 
 
 async def run_composio_analysis(args: argparse.Namespace, evidence: list[Evidence]) -> str:
+    write_stage(args, "loading_env")
     load_dotenv(Path.cwd() / ".env")
+    write_stage(args, "checking_env")
     require_environment()
 
+    write_stage(args, "importing_dependencies")
     try:
         from agents import Agent, Runner
         from composio import Composio
         from composio_openai_agents import OpenAIAgentsProvider
     except ImportError as exc:
+        write_stage(args, "dependency_import_failed", str(exc))
         raise RuntimeError(
             "Missing Composio/OpenAI Agents dependencies. Install with: "
             "pip install composio composio-openai-agents openai-agents"
         ) from exc
 
+    write_stage(args, "creating_composio_client")
     composio = Composio(provider=OpenAIAgentsProvider())
+    workbench = composio_workbench_config()
+    workbench_label = "enabled" if workbench.get("enable") else "disabled"
+    write_stage(args, "creating_composio_session", f"workbench={workbench_label}")
     session = composio.create(
         user_id=args.user_id,
-        workbench={"sandbox_size": "medium"},
+        workbench=workbench,
     )
+    write_stage(args, "loading_composio_tools")
+    tools = session.tools()
 
+    write_stage(args, "building_agent")
     agent = Agent(
         name="Game Control Analyzer",
         model=args.model,
@@ -761,11 +819,13 @@ async def run_composio_analysis(args: argparse.Namespace, evidence: list[Evidenc
             "Use Composio tools if you need extra planning or code execution, "
             "but the final answer must be compact valid JSON only."
         ),
-        tools=session.tools(),
+        tools=tools,
     )
 
+    write_stage(args, "collecting_local_candidates")
     local_candidates = collect_local_candidates(Path(args.source).resolve(), args.max_files, args.max_context_lines)
     try:
+        write_stage(args, "running_agent")
         result = await Runner.run(
             starting_agent=agent,
             input=build_agent_input(
@@ -774,8 +834,10 @@ async def run_composio_analysis(args: argparse.Namespace, evidence: list[Evidenc
                 local_candidates,
             ),
         )
+        write_stage(args, "normalizing_agent_output")
         return normalize_agent_output(result.final_output, evidence, local_candidates)
     except Exception as exc:
+        write_stage(args, "agent_failed_using_local_fallback", str(exc))
         print(
             f"[WARN] Agent analysis failed; using local keyboard candidate fallback. {exc}",
             file=sys.stderr,
@@ -799,13 +861,18 @@ def main() -> None:
     args = parse_args()
     source = Path(args.source).resolve()
 
+    write_stage(args, "validating_source")
     if not source.exists():
+        write_stage(args, "source_missing", str(source))
         raise FileNotFoundError(f"Source path does not exist: {source}")
 
+    write_stage(args, "collecting_evidence")
     evidence = collect_evidence(source, args.max_files, args.max_evidence, args.max_context_lines)
+    write_stage(args, "collecting_local_candidates")
     local_candidates = collect_local_candidates(source, args.max_files, args.max_context_lines)
 
     if args.collect_only:
+        write_stage(args, "writing_collect_only_output")
         output = json.dumps(
             {
                 "local_candidates": [asdict(item) for item in local_candidates],
@@ -815,15 +882,21 @@ def main() -> None:
             indent=2,
         )
         write_output(output, args.json_out)
+        write_stage(args, "complete")
         return
 
     if not evidence:
+        write_stage(args, "no_evidence")
         empty_result = json.dumps({"controls": [], "unresolved": []}, indent=2)
         write_output(empty_result, args.json_out)
+        write_stage(args, "complete")
         return
 
+    write_stage(args, "starting_composio_analysis")
     output = asyncio.run(run_composio_analysis(args, evidence))
+    write_stage(args, "writing_analysis_output")
     write_output(output, args.json_out)
+    write_stage(args, "complete")
 
 
 if __name__ == "__main__":

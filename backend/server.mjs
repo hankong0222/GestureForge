@@ -1,12 +1,45 @@
 import { createServer, request as httpRequest } from "node:http";
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join, normalize, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { loginUser, signupUser } from "./auth.mjs";
 
 const rootDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
+
+function loadDotenvFile(path) {
+  try {
+    const lines = readFileSync(path, "utf-8").replace(/^\uFEFF/, "").split(/\r?\n/);
+
+    lines.forEach((rawLine) => {
+      const line = rawLine.trim();
+
+      if (!line || line.startsWith("#") || !line.includes("=")) {
+        return;
+      }
+
+      const equalsIndex = line.indexOf("=");
+      const key = line.slice(0, equalsIndex).trim();
+      let value = line.slice(equalsIndex + 1).trim();
+
+      if (!key || process.env[key] !== undefined) {
+        return;
+      }
+
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+
+      process.env[key] = value;
+    });
+  } catch {
+  }
+}
+
+loadDotenvFile(resolve(rootDir, ".env"));
+
 const assetDir = resolve(rootDir, "asset");
 const sessionsDir = resolve(rootDir, "tmp", "sessions");
 const recordingsDir = resolve(rootDir, "tmp", "recordings");
@@ -18,6 +51,13 @@ const analyzerModel = process.env.ANALYZER_MODEL ?? "gpt-4o-mini";
 const analyzerMaxFiles = process.env.ANALYZER_MAX_FILES ?? "50";
 const analyzerMaxEvidence = process.env.ANALYZER_MAX_EVIDENCE ?? "25";
 const analyzerMaxContextLines = process.env.ANALYZER_MAX_CONTEXT_LINES ?? "1";
+const cloudinaryCloudName = (process.env.CLOUDINARY_CLOUD_NAME ?? process.env.VITE_CLOUDINARY_CLOUD_NAME ?? "").trim();
+const cloudinaryApiKey = (process.env.CLOUDINARY_API_KEY ?? "").trim();
+const cloudinaryApiSecret = (process.env.CLOUDINARY_API_SECRET ?? "").trim();
+const cloudinaryRenderFolder = String(process.env.CLOUDINARY_RENDER_FOLDER ?? "gestureforge-renders")
+  .replace(/^\/+|\/+$/g, "");
+const cloudinaryAssetFolder = String(process.env.CLOUDINARY_ASSET_FOLDER ?? `${cloudinaryRenderFolder}/assets`)
+  .replace(/^\/+|\/+$/g, "");
 
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
@@ -198,7 +238,6 @@ function runCommand(command, args, options = {}) {
 
     let stdout = "";
     let stderr = "";
-
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
     });
@@ -246,6 +285,31 @@ function cameraHealth() {
   });
 }
 
+function requestCameraShutdown() {
+  return new Promise((resolvePromise) => {
+    const request = httpRequest(
+      {
+        host: "127.0.0.1",
+        port: cameraPort,
+        path: "/shutdown",
+        method: "POST",
+        timeout: 800,
+      },
+      (shutdownResponse) => {
+        shutdownResponse.resume();
+        resolvePromise(shutdownResponse.statusCode === 200);
+      },
+    );
+
+    request.on("timeout", () => {
+      request.destroy();
+      resolvePromise(false);
+    });
+    request.on("error", () => resolvePromise(false));
+    request.end();
+  });
+}
+
 async function ensureCameraStream() {
   if (await cameraHealth()) {
     return;
@@ -279,7 +343,7 @@ async function ensureCameraStream() {
       cameraProcess = null;
     });
     cameraProcess.on("close", (code) => {
-      if (code !== 0 && !cameraError) {
+      if (code !== 0 && code !== null && !cameraError) {
         cameraError = `camera process exited with ${code}`;
       }
       cameraProcess = null;
@@ -303,14 +367,26 @@ async function ensureCameraStream() {
   }
 }
 
-function stopCameraStream() {
+async function stopCameraStream() {
   if (cameraStartPromise) {
     cameraStartPromise = null;
   }
 
+  const serviceStopped = await requestCameraShutdown();
+
   if (!cameraProcess) {
     cameraError = "";
-    return false;
+    return serviceStopped;
+  }
+
+  if (serviceStopped) {
+    await wait(700);
+
+    if (!(await cameraHealth())) {
+      cameraProcess = null;
+      cameraError = "";
+      return true;
+    }
   }
 
   try {
@@ -914,17 +990,626 @@ async function getOrCreateClipPlan(recordingId) {
   return saveClipPlan(recording, analysis);
 }
 
+function requireCloudinaryCredentials() {
+  const missing = [];
+
+  if (!cloudinaryCloudName) {
+    missing.push("CLOUDINARY_CLOUD_NAME");
+  }
+
+  if (!cloudinaryApiKey) {
+    missing.push("CLOUDINARY_API_KEY");
+  }
+
+  if (!cloudinaryApiSecret) {
+    missing.push("CLOUDINARY_API_SECRET");
+  }
+
+  if (missing.length) {
+    throw new Error(`Set ${missing.join(", ")} in .env before rendering Cloudinary MP4 exports.`);
+  }
+}
+
+function cloudinaryUploadAuthHeader() {
+  return `Basic ${Buffer.from(`${cloudinaryApiKey}:${cloudinaryApiSecret}`).toString("base64")}`;
+}
+
+function encodeCloudinaryPathSegment(value) {
+  return encodeURIComponent(String(value ?? ""))
+    .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function cloudinaryDeliveryPublicId(publicId) {
+  return String(publicId ?? "")
+    .split("/")
+    .filter(Boolean)
+    .map(encodeCloudinaryPathSegment)
+    .join("/");
+}
+
+function cloudinaryLayerPublicId(publicId) {
+  return String(publicId ?? "")
+    .split("/")
+    .filter(Boolean)
+    .map(encodeCloudinaryPathSegment)
+    .join(":");
+}
+
+function cloudinaryText(value) {
+  return encodeCloudinaryPathSegment(cleanOverlayText(value, ""))
+    .replaceAll("%0A", "%20")
+    .replaceAll("%0D", "%20");
+}
+
+function cloudinaryNumber(value, fallback = 0) {
+  return Number(numberOr(value, fallback).toFixed(2)).toString();
+}
+
+function cloudinaryDeliveryUrl({ cloudName = cloudinaryCloudName, publicId, resourceType = "video", transformations = [], format = "mp4" }) {
+  const transformationPath = transformations.filter(Boolean).join("/");
+  const publicPath = cloudinaryDeliveryPublicId(publicId);
+  const suffix = format ? `.${format}` : "";
+
+  return `https://res.cloudinary.com/${encodeCloudinaryPathSegment(cloudName)}/${resourceType}/upload/${transformationPath ? `${transformationPath}/` : ""}${publicPath}${suffix}`;
+}
+
+function cloudinaryAssetResourceType(asset) {
+  return asset.kind === "sound" ? "video" : "image";
+}
+
+function cloudinaryAssetPublicId(asset) {
+  return `${cloudinaryAssetFolder}/${asset.id}`;
+}
+
+function cloudinaryRenderPublicId(recording, ...parts) {
+  return [cloudinaryRenderFolder, recording.recording_id, ...parts]
+    .map((part) => String(part ?? "").replace(/^\/+|\/+$/g, ""))
+    .filter(Boolean)
+    .join("/");
+}
+
+async function cloudinaryUpload(resourceType, buildFormData, { attempts = 2 } = {}) {
+  requireCloudinaryCredentials();
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const formData = new FormData();
+    await buildFormData(formData);
+
+    try {
+      const response = await fetch(`https://api.cloudinary.com/v1_1/${cloudinaryCloudName}/${resourceType}/upload`, {
+        method: "POST",
+        headers: {
+          Authorization: cloudinaryUploadAuthHeader(),
+        },
+        body: formData,
+      });
+      const text = await response.text();
+      let payload = {};
+
+      try {
+        payload = JSON.parse(text || "{}");
+      } catch {
+        payload = { raw: text };
+      }
+
+      if (response.ok) {
+        return payload;
+      }
+
+      lastError = new Error(payload.error?.message || payload.message || `Cloudinary upload failed with ${response.status}.`);
+
+      if (![420, 423, 429, 500, 502, 503, 504].includes(response.status) || attempt === attempts) {
+        throw lastError;
+      }
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === attempts) {
+        throw error;
+      }
+    }
+
+    await wait(2000 * attempt);
+  }
+
+  throw lastError || new Error("Cloudinary upload failed.");
+}
+
+async function uploadLocalAssetToCloudinary(asset) {
+  const resourceType = cloudinaryAssetResourceType(asset);
+  const publicId = cloudinaryAssetPublicId(asset);
+  const filePath = resolve(assetDir, asset.filename);
+  const info = await stat(filePath);
+
+  if (!info.isFile()) {
+    throw new Error(`Local asset is missing: ${asset.filename}`);
+  }
+
+  const bytes = await readFile(filePath);
+  const mimeType = contentTypes[extname(filePath).toLowerCase()] ?? "application/octet-stream";
+  const result = await cloudinaryUpload(resourceType, (formData) => {
+    formData.append("file", new Blob([bytes], { type: mimeType }), asset.filename);
+    formData.append("public_id", publicId);
+    formData.append("overwrite", "true");
+    formData.append("invalidate", "true");
+    formData.append("tags", "gestureforge,gestureforge-local-asset");
+  });
+
+  return {
+    ...asset,
+    cloudinary_public_id: result.public_id || publicId,
+    cloudinary_resource_type: result.resource_type || resourceType,
+    cloudinary_url: result.secure_url || result.url || cloudinaryDeliveryUrl({
+      publicId,
+      resourceType,
+      format: resourceType === "image" ? extname(asset.filename).slice(1) : "mp3",
+    }),
+  };
+}
+
+async function syncLocalClipAssetsToCloudinary(assetCatalog) {
+  const synced = {};
+
+  for (const asset of assetCatalog) {
+    synced[asset.id] = await uploadLocalAssetToCloudinary(asset);
+  }
+
+  return synced;
+}
+
+function validateRenderAssetSelection(assetCatalog, assetId, kind) {
+  const normalizedId = String(assetId ?? "").trim();
+
+  if (!normalizedId || normalizedId === "none") {
+    return null;
+  }
+
+  const asset = hintedAsset(assetCatalog, normalizedId, kind);
+
+  if (!asset) {
+    throw new Error(`Asset ${normalizedId} is not allowed for ${kind}.`);
+  }
+
+  return asset;
+}
+
+function normalizeOverlayText(overlay, fallbackDuration) {
+  const text = cleanOverlayText(overlay?.text, "");
+
+  if (!text) {
+    return null;
+  }
+
+  const start = Math.max(0, numberOr(overlay.start, 0));
+  const duration = Math.max(0.4, Math.min(fallbackDuration, numberOr(overlay.duration, Math.min(2.8, fallbackDuration))));
+
+  return {
+    type: "text",
+    role: String(overlay.role || "caption"),
+    text,
+    position: String(overlay.position || (overlay.role === "meme_title" ? "top" : "bottom")),
+    start: Number(start.toFixed(2)),
+    duration: Number(duration.toFixed(2)),
+  };
+}
+
+function normalizeRenderableClip(recording, plan, clip, index, assetCatalog) {
+  const sourceDuration = numberOr(plan?.source?.duration, numberOr(recording.duration, 0));
+  const sourceLimit = sourceDuration || Infinity;
+  const rawStart = Math.min(Math.max(0, numberOr(clip?.trim?.start, 0)), Math.max(0, sourceLimit - 0.8));
+  const requestedEnd = numberOr(clip?.trim?.end, rawStart + 4);
+  const rawEnd = sourceDuration
+    ? Math.min(sourceDuration, Math.max(rawStart + 0.8, requestedEnd))
+    : Math.max(rawStart + 0.8, requestedEnd);
+  const duration = rawEnd - rawStart;
+  const memeAsset = validateRenderAssetSelection(
+    assetCatalog,
+    clip?.selected_assets?.meme ?? clip?.overlays?.find((overlay) => overlay?.type === "asset")?.asset_id,
+    "meme",
+  );
+  const soundAsset = validateRenderAssetSelection(
+    assetCatalog,
+    clip?.selected_assets?.sound ?? clip?.sound_effects?.[0]?.asset_id,
+    "sound",
+  );
+  const textOverlays = (Array.isArray(clip?.overlays) ? clip.overlays : [])
+    .filter((overlay) => overlay?.type === "text")
+    .map((overlay) => normalizeOverlayText(overlay, duration))
+    .filter(Boolean);
+  const titleText = cleanOverlayText(clip?.source_highlight?.title, `Clip ${index + 1}`).toUpperCase();
+
+  if (!textOverlays.some((overlay) => overlay.role === "meme_title")) {
+    textOverlays.unshift({
+      type: "text",
+      role: "meme_title",
+      text: titleText,
+      position: "top",
+      start: 0,
+      duration: Number(Math.min(2.8, duration).toFixed(2)),
+    });
+  }
+
+  const captions = (Array.isArray(clip?.captions) ? clip.captions : [])
+    .map((caption) => ({
+      start: Number(Math.max(0, numberOr(caption.start, 0)).toFixed(2)),
+      end: Number(Math.min(duration, Math.max(0.2, numberOr(caption.end, 0.2))).toFixed(2)),
+      text: cleanOverlayText(caption.text, ""),
+    }))
+    .filter((caption) => caption.text && caption.end > caption.start)
+    .slice(0, 5);
+
+  return {
+    ...clip,
+    id: clip?.id || `clip_${String(index + 1).padStart(2, "0")}`,
+    order: index + 1,
+    source_public_id: recording.public_id,
+    trim: {
+      start: Number(rawStart.toFixed(2)),
+      end: Number(rawEnd.toFixed(2)),
+      duration: Number(duration.toFixed(2)),
+    },
+    crop: {
+      aspect_ratio: "9:16",
+      width: 1080,
+      height: 1920,
+      mode: "fill",
+      gravity: "auto",
+    },
+    captions,
+    overlays: [
+      memeAsset
+        ? {
+            type: "asset",
+            role: "meme_reaction",
+            asset_id: memeAsset.id,
+            asset_path: memeAsset.path,
+            label: memeAsset.label,
+            position: "upper_right",
+            start: Number(Math.min(0.2, duration / 5).toFixed(2)),
+            duration: Number(Math.min(2.2, duration).toFixed(2)),
+          }
+        : null,
+      ...textOverlays,
+    ].filter(Boolean),
+    sound_effects: soundAsset
+      ? [
+          {
+            asset_id: soundAsset.id,
+            asset_path: soundAsset.path,
+            label: soundAsset.label,
+            start: Number(Math.min(Math.max(0.2, duration * 0.2), Math.max(0, duration - 0.5)).toFixed(2)),
+            volume: Math.max(0.15, Math.min(1, numberOr(clip?.sound_effects?.[0]?.volume, 0.45))),
+            mix: "duck_original_audio",
+          },
+        ]
+      : [],
+    selected_assets: {
+      meme: memeAsset?.id ?? null,
+      sound: soundAsset?.id ?? null,
+    },
+  };
+}
+
+function normalizeRenderablePlan(recording, plan, assetCatalog) {
+  const clips = Array.isArray(plan?.sequence?.clips) ? plan.sequence.clips : [];
+
+  if (!clips.length) {
+    throw new Error("Clip plan has no clips to render.");
+  }
+
+  return {
+    ...plan,
+    status: "rendering",
+    source: {
+      ...(plan.source ?? {}),
+      public_id: recording.public_id,
+      video_url: recording.video_url,
+      duration: numberOr(plan?.source?.duration, numberOr(recording.duration, 0)) || null,
+    },
+    output: {
+      format: "mp4",
+      width: 1080,
+      height: 1920,
+      aspect_ratio: "9:16",
+      video_codec: "h264",
+      audio_codec: "aac",
+      quality: "auto",
+    },
+    sequence: {
+      mode: "splice",
+      transition: "cut",
+      clips: clips.slice(0, 6).map((clip, index) => normalizeRenderableClip(recording, plan, clip, index, assetCatalog)),
+    },
+    asset_policy: {
+      source: "local_asset_directory_only",
+      asset_root: "asset",
+      allowed_asset_ids: assetCatalog.map((asset) => asset.id),
+      note: "Cloudinary render may only sync and use assets listed in asset_catalog.",
+    },
+    asset_catalog: assetCatalog,
+  };
+}
+
+function textLayerPlacement(position) {
+  if (position === "top") {
+    return "g_north,y_70";
+  }
+
+  if (position === "center") {
+    return "g_center";
+  }
+
+  return "g_south,y_105";
+}
+
+function buildTextOverlayTransformation(overlay, fontFamily, fontSize) {
+  const duration = Math.max(0.4, numberOr(overlay.duration, 2));
+  const start = Math.max(0, numberOr(overlay.start, 0));
+  const placement = textLayerPlacement(overlay.position);
+  const text = cloudinaryText(overlay.text);
+
+  if (!text) {
+    return "";
+  }
+
+  return `l_text:${fontFamily}_${fontSize}_bold:${text},co_white,b_rgb:00000099/fl_layer_apply,${placement},so_${cloudinaryNumber(start)},du_${cloudinaryNumber(duration)}`;
+}
+
+function buildCaptionOverlayTransformation(caption) {
+  const start = Math.max(0, numberOr(caption.start, 0));
+  const duration = Math.max(0.25, numberOr(caption.end, start + 1) - start);
+  const text = cloudinaryText(caption.text);
+
+  if (!text) {
+    return "";
+  }
+
+  return `l_text:Arial_58_bold:${text},co_white,b_rgb:00000099/fl_layer_apply,g_south,y_58,so_${cloudinaryNumber(start)},du_${cloudinaryNumber(duration)}`;
+}
+
+function buildMemeOverlayTransformation(overlay, syncedAsset) {
+  if (!syncedAsset?.cloudinary_public_id) {
+    return "";
+  }
+
+  const start = Math.max(0, numberOr(overlay.start, 0));
+  const duration = Math.max(0.5, numberOr(overlay.duration, 1.8));
+  const publicId = cloudinaryLayerPublicId(syncedAsset.cloudinary_public_id);
+
+  return `l_${publicId}/c_fit,w_360,h_360/fl_layer_apply,g_north_east,x_52,y_118,so_${cloudinaryNumber(start)},du_${cloudinaryNumber(duration)}`;
+}
+
+function buildAudioOverlayTransformation(soundEffect, syncedAsset, clipDuration) {
+  if (!syncedAsset?.cloudinary_public_id) {
+    return "";
+  }
+
+  const start = Math.max(0, numberOr(soundEffect.start, 0));
+  const duration = Math.max(0.4, Math.min(clipDuration - start, 2.2));
+  const volume = Math.round(Math.max(0.1, Math.min(1, numberOr(soundEffect.volume, 0.45))) * 100);
+  const publicId = cloudinaryLayerPublicId(syncedAsset.cloudinary_public_id);
+
+  return `l_audio:${publicId},du_${cloudinaryNumber(duration)}/e_volume:${volume}/fl_layer_apply,so_${cloudinaryNumber(start)}`;
+}
+
+function buildEditedClipUrl(recording, clip, syncedAssets) {
+  const width = numberOr(clip.crop?.width, 1080);
+  const height = numberOr(clip.crop?.height, 1920);
+  const gravity = clip.crop?.gravity === "auto" ? "auto" : "center";
+  const transformations = [
+    `so_${cloudinaryNumber(clip.trim?.start)},eo_${cloudinaryNumber(clip.trim?.end)}`,
+    `c_fill,w_${width},h_${height},g_${gravity}`,
+  ];
+
+  if (clip.sound_effects?.length) {
+    transformations.push("e_volume:82");
+  }
+
+  clip.overlays
+    ?.filter((overlay) => overlay.type === "asset")
+    .forEach((overlay) => {
+      const component = buildMemeOverlayTransformation(overlay, syncedAssets[overlay.asset_id]);
+
+      if (component) {
+        transformations.push(component);
+      }
+    });
+
+  clip.overlays
+    ?.filter((overlay) => overlay.type === "text")
+    .slice(0, 3)
+    .forEach((overlay) => {
+      const component = buildTextOverlayTransformation(
+        overlay,
+        "Arial",
+        overlay.role === "meme_title" ? 78 : 48,
+      );
+
+      if (component) {
+        transformations.push(component);
+      }
+    });
+
+  clip.captions?.slice(0, 4).forEach((caption) => {
+    const component = buildCaptionOverlayTransformation(caption);
+
+    if (component) {
+      transformations.push(component);
+    }
+  });
+
+  clip.sound_effects?.slice(0, 1).forEach((soundEffect) => {
+    const component = buildAudioOverlayTransformation(soundEffect, syncedAssets[soundEffect.asset_id], numberOr(clip.trim?.duration, 3));
+
+    if (component) {
+      transformations.push(component);
+    }
+  });
+
+  if (clip.effects?.zoom?.enabled) {
+    transformations.push("c_fill,w_1188,h_2112,g_auto/c_crop,w_1080,h_1920,g_auto");
+  }
+
+  transformations.push("q_auto,vc_h264,ac_aac");
+
+  return cloudinaryDeliveryUrl({
+    publicId: recording.public_id,
+    resourceType: "video",
+    transformations,
+    format: "mp4",
+  });
+}
+
+async function uploadCloudinaryRemoteVideo(sourceUrl, publicId, tags = "gestureforge,gestureforge-render") {
+  return cloudinaryUpload("video", (formData) => {
+    formData.append("file", sourceUrl);
+    formData.append("public_id", publicId);
+    formData.append("overwrite", "true");
+    formData.append("invalidate", "true");
+    formData.append("tags", tags);
+  }, { attempts: 3 });
+}
+
+function buildFinalSpliceUrl(clipRenders) {
+  const [firstClip, ...restClips] = clipRenders;
+
+  if (!firstClip) {
+    throw new Error("No rendered clips to splice.");
+  }
+
+  const transformations = [
+    "c_fill,w_1080,h_1920,g_auto",
+    ...restClips.flatMap((clip) => [
+      `l_video:${cloudinaryLayerPublicId(clip.public_id)}`,
+      "c_fill,w_1080,h_1920,g_auto",
+      "fl_layer_apply,fl_splice",
+    ]),
+    "q_auto,vc_h264,ac_aac",
+  ];
+
+  return cloudinaryDeliveryUrl({
+    publicId: firstClip.public_id,
+    resourceType: "video",
+    transformations,
+    format: "mp4",
+  });
+}
+
+async function renderRecordingClipPlan(recordingId, proposedPlan) {
+  requireCloudinaryCredentials();
+
+  const recording = await readRecordingMeta(recordingId);
+  const savedPlan = await getOrCreateClipPlan(recording.recording_id);
+  const assetCatalog = await localClipAssetCatalog();
+  const renderPlan = normalizeRenderablePlan(recording, proposedPlan && typeof proposedPlan === "object" ? proposedPlan : savedPlan, assetCatalog);
+
+  await patchRecordingMeta(recording.recording_id, {
+    clip_render_status: "syncing_assets",
+    clip_render_error: undefined,
+  });
+
+  const syncedAssets = await syncLocalClipAssetsToCloudinary(assetCatalog);
+  const clipRenders = [];
+
+  await patchRecordingMeta(recording.recording_id, {
+    clip_render_status: "rendering_clips",
+  });
+
+  for (const clip of renderPlan.sequence.clips) {
+    const sourceTransformUrl = buildEditedClipUrl(recording, clip, syncedAssets);
+    const publicId = cloudinaryRenderPublicId(recording, "clips", clip.id);
+    const upload = await uploadCloudinaryRemoteVideo(sourceTransformUrl, publicId);
+
+    clipRenders.push({
+      clip_id: clip.id,
+      public_id: upload.public_id || publicId,
+      source_transform_url: sourceTransformUrl,
+      video_url: upload.secure_url || upload.url || cloudinaryDeliveryUrl({ publicId, resourceType: "video", format: "mp4" }),
+      duration: clip.trim.duration,
+    });
+  }
+
+  await patchRecordingMeta(recording.recording_id, {
+    clip_render_status: "splicing",
+  });
+
+  const finalTransformUrl = buildFinalSpliceUrl(clipRenders);
+  const finalPublicId = cloudinaryRenderPublicId(recording, "final");
+  const finalUpload = await uploadCloudinaryRemoteVideo(finalTransformUrl, finalPublicId, "gestureforge,gestureforge-final-render");
+  const resolvedFinalPublicId = finalUpload.public_id || finalPublicId;
+  const resolvedFinalUrl = finalUpload.secure_url || finalUpload.url || cloudinaryDeliveryUrl({ publicId: resolvedFinalPublicId, resourceType: "video", format: "mp4" });
+  const resolvedDownloadUrl = cloudinaryDeliveryUrl({
+    publicId: resolvedFinalPublicId,
+    resourceType: "video",
+    transformations: ["fl_attachment"],
+    format: "mp4",
+  });
+  const manifest = {
+    version: 1,
+    status: "rendered",
+    generated_at: new Date().toISOString(),
+    recording_id: recording.recording_id,
+    cloudinary_cloud_name: cloudinaryCloudName,
+    source_public_id: recording.public_id,
+    final_public_id: resolvedFinalPublicId,
+    final_url: resolvedFinalUrl,
+    final_transform_url: finalTransformUrl,
+    download_url: resolvedDownloadUrl,
+    clip_renders: clipRenders,
+    synced_assets: Object.fromEntries(
+      Object.entries(syncedAssets).map(([id, asset]) => [
+        id,
+        {
+          kind: asset.kind,
+          label: asset.label,
+          local_path: asset.path,
+          public_id: asset.cloudinary_public_id,
+          resource_type: asset.cloudinary_resource_type,
+          url: asset.cloudinary_url,
+        },
+      ]),
+    ),
+    rendered_features: {
+      trim: true,
+      crop_9_16: true,
+      splice: true,
+      text_overlays: true,
+      captions: true,
+      meme_assets: true,
+      sound_effects: true,
+      zoom: renderPlan.sequence.clips.some((clip) => clip.effects?.zoom?.enabled),
+      freeze_frame: false,
+    },
+    plan: renderPlan,
+  };
+
+  await writeFile(recordingPath(recording.recording_id, "clip-render.json"), JSON.stringify(manifest, null, 2), "utf-8");
+  await patchRecordingMeta(recording.recording_id, {
+    clip_render_status: "rendered",
+    clip_render_path: "clip-render.json",
+    clip_render_public_id: manifest.final_public_id,
+    clip_render_url: manifest.final_url,
+    clip_render_finished_at: manifest.generated_at,
+  });
+
+  return manifest;
+}
+
 async function runKeyboardAnalyzer(sessionId) {
   const sourceDir = sessionPath(sessionId, "original");
   const analysisPath = sessionPath(sessionId, "analysis.json");
+  const stagePath = sessionPath(sessionId, "analysis-stage.json");
   const scriptPath = resolve(rootDir, "tools", "analyze_game_controls_with_composio.py");
-
-  await runCommand(pythonExecutable, [
+  const commonArgs = [
     scriptPath,
     "--source",
     sourceDir,
     "--json-out",
     analysisPath,
+    "--stage-out",
+    stagePath,
     "--model",
     analyzerModel,
     "--max-files",
@@ -933,7 +1618,9 @@ async function runKeyboardAnalyzer(sessionId) {
     analyzerMaxEvidence,
     "--max-context-lines",
     analyzerMaxContextLines,
-  ]);
+  ];
+
+  await runCommand(pythonExecutable, commonArgs);
 
   return JSON.parse(await readFile(analysisPath, "utf-8"));
 }
@@ -994,6 +1681,13 @@ async function runPatchPlanner(sessionId) {
 }
 
 async function markSessionFailed(sessionId, meta, error) {
+  const currentMeta = await readOptionalJson(sessionPath(sessionId, "session.json"));
+  const existingAnalysis = await readOptionalJson(sessionPath(sessionId, "analysis.json"));
+
+  if (currentMeta?.status === "ready" && existingAnalysis) {
+    return;
+  }
+
   const hint = error.message.includes("rate_limit_exceeded") || error.message.includes("Request too large")
     ? "Analyzer request was too large. Restart backend with -Model gpt-4o-mini -MaxFiles 50 -MaxEvidence 25."
     : undefined;
@@ -1008,16 +1702,25 @@ async function markSessionFailed(sessionId, meta, error) {
 }
 
 async function analyzeSession(sessionId, meta) {
+  const currentBeforeAnalyze = await readOptionalJson(sessionPath(sessionId, "session.json"));
+
   await writeSessionMeta(sessionId, {
-    ...meta,
+    ...(currentBeforeAnalyze ?? meta),
     status: "analyzing",
+    analyzing_started_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
 
   await runKeyboardAnalyzer(sessionId);
 
+  const currentMeta = await readOptionalJson(sessionPath(sessionId, "session.json"));
+
+  if (currentMeta?.status === "ready") {
+    return;
+  }
+
   await writeSessionMeta(sessionId, {
-    ...meta,
+    ...(currentMeta ?? meta),
     status: "ready",
     analysis_path: "analysis.json",
     game_url: `/api/sessions/${sessionId}/game/`,
@@ -1031,10 +1734,19 @@ async function processGithubSession(sessionId, meta, cloneUrl) {
     await writeSessionMeta(sessionId, {
       ...meta,
       status: "cloning",
+      clone_started_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     });
 
     await runCommand("git", ["clone", "--depth", "1", cloneUrl, originalDir], { cwd: rootDir });
+    await writeSessionMeta(sessionId, {
+      ...meta,
+      status: "cloned",
+      clone_started_at: (await readOptionalJson(sessionPath(sessionId, "session.json")))?.clone_started_at,
+      cloned_at: new Date().toISOString(),
+      source_path: "original",
+      updated_at: new Date().toISOString(),
+    });
     await analyzeSession(sessionId, meta);
   } catch (error) {
     await markSessionFailed(sessionId, meta, error);
@@ -1619,7 +2331,7 @@ async function handleRequest(request, response) {
     }
 
     if (request.method === "POST" && url.pathname === "/api/camera/stop") {
-      const stopped = stopCameraStream();
+      const stopped = await stopCameraStream();
       jsonResponse(response, 200, {
         status: "stopped",
         stopped,
@@ -1635,6 +2347,18 @@ async function handleRequest(request, response) {
 
     if (request.method === "GET" && url.pathname === "/api/camera/state") {
       await proxyCameraState(response);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/auth/signup") {
+      const result = await signupUser(await readJsonBody(request));
+      jsonResponse(response, result.status, result.payload);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/auth/login") {
+      const result = await loginUser(await readJsonBody(request));
+      jsonResponse(response, result.status, result.payload);
       return;
     }
 
@@ -1737,6 +2461,53 @@ async function handleRequest(request, response) {
       return;
     }
 
+    const clipRenderMatch = url.pathname.match(/^\/api\/recordings\/([a-z0-9-]+)\/render$/i);
+    if (request.method === "GET" && clipRenderMatch) {
+      const recording = await readRecordingMeta(clipRenderMatch[1]);
+      const render = await readOptionalJson(recordingPath(recording.recording_id, "clip-render.json"));
+
+      if (!render) {
+        jsonResponse(response, 404, {
+          recording_id: recording.recording_id,
+          clip_render_status: recording.clip_render_status || "idle",
+          error: recording.clip_render_error || "No rendered MP4 yet.",
+        });
+        return;
+      }
+
+      jsonResponse(response, 200, {
+        recording_id: recording.recording_id,
+        clip_render_status: render.status,
+        render,
+      });
+      return;
+    }
+
+    if (request.method === "POST" && clipRenderMatch) {
+      const body = await readJsonBody(request);
+
+      try {
+        const render = await renderRecordingClipPlan(clipRenderMatch[1], body.plan);
+        jsonResponse(response, 200, {
+          recording_id: clipRenderMatch[1],
+          clip_render_status: render.status,
+          render,
+        });
+      } catch (error) {
+        await patchRecordingMeta(clipRenderMatch[1], {
+          clip_render_status: "failed",
+          clip_render_error: error.message,
+          clip_render_finished_at: new Date().toISOString(),
+        });
+        jsonResponse(response, 500, {
+          recording_id: clipRenderMatch[1],
+          clip_render_status: "failed",
+          error: error.message,
+        });
+      }
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/api/sessions/github") {
       const body = await readJsonBody(request);
       jsonResponse(response, 201, await createSessionFromGithub(body.github_url));
@@ -1750,8 +2521,13 @@ async function handleRequest(request, response) {
 
     const statusMatch = url.pathname.match(/^\/api\/sessions\/([a-z0-9-]+)$/i);
     if (request.method === "GET" && statusMatch) {
-      const meta = JSON.parse(await readFile(sessionPath(statusMatch[1], "session.json"), "utf-8"));
-      jsonResponse(response, 200, meta);
+      const sessionId = statusMatch[1];
+      const meta = JSON.parse(await readFile(sessionPath(sessionId, "session.json"), "utf-8"));
+      const analysisStage = await readOptionalJson(sessionPath(sessionId, "analysis-stage.json"));
+      jsonResponse(response, 200, {
+        ...meta,
+        ...(analysisStage ? { analysis_stage: analysisStage } : {}),
+      });
       return;
     }
 
